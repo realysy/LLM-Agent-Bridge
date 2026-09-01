@@ -1,0 +1,4 @@
+interface:
+  display_name: "Universal Agent Bridge"
+  short_description: "Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Grok, Qwen"
+  default_prompt: "使用 $universal-agent-bridge 处理这个复杂推理与编码任务。"

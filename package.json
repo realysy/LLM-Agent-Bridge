@@ -1,0 +1,20 @@
+{
+  "name": "universal-agent-bridge",
+  "version": "0.5.0",
+  "private": true,
+  "type": "module",
+  "description": "Universal AI Agent Reasoning Bridge to ChatGPT, Claude, DeepSeek, Gemini, Grok, Qwen, Doubao, and GLM Web via local WebSocket/HTTP transport.",
+  "license": "Apache-2.0",
+  "bin": {
+    "universal-agent-bridge": "./skills/universal-agent-bridge/scripts/ws-transport.mjs"
+  },
+  "scripts": {
+    "test": "node tests/run-all.mjs",
+    "doctor": "node skills/universal-agent-bridge/scripts/doctor.mjs --json",
+    "verify": "node scripts/verify.mjs",
+    "bridge": "node skills/universal-agent-bridge/scripts/ws-transport.mjs serve"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

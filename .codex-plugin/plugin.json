@@ -1,0 +1,33 @@
+{
+  "name": "universal-agent-bridge",
+  "version": "0.5.0",
+  "description": "Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Grok, Qwen, Doubao, and GLM Web while keeping repository authority and execution strictly local.",
+  "author": {
+    "name": "EasongChung & Universal Agent Community",
+    "url": "https://github.com/EasongChung/Universal-Agent-Bridge"
+  },
+  "homepage": "https://github.com/EasongChung/Universal-Agent-Bridge#readme",
+  "repository": "https://github.com/EasongChung/Universal-Agent-Bridge",
+  "license": "Apache-2.0",
+  "keywords": [
+    "agent",
+    "codex",
+    "chatgpt",
+    "claude",
+    "deepseek",
+    "gemini",
+    "grok",
+    "qwen",
+    "reasoning",
+    "browser",
+    "websocket",
+    "userscript"
+  ],
+  "skills": [
+    {
+      "name": "universal-agent-bridge",
+      "path": "skills/universal-agent-bridge",
+      "description": "Delegates high-cost reasoning tasks to top AI Web platforms (ChatGPT, Claude, DeepSeek, Gemini, Grok, Qwen) with local gate validation."
+    }
+  ]
+}

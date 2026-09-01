@@ -1,0 +1,29 @@
+import assert from 'node:assert/strict';
+import { dirname, join } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import test from 'node:test';
+
+const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const skillRoot = join(repoRoot, 'skills', 'universal-agent-bridge');
+
+test('publishes the bridge skill under its portable package identity', async () => {
+  const skill = await readFile(join(skillRoot, 'SKILL.md'), 'utf8');
+  const name = skill.match(/^name:\s*([a-z0-9-]+)$/m)?.[1];
+
+  assert.equal(name, 'universal-agent-bridge');
+
+  const interfaceYaml = await readFile(join(skillRoot, 'agents/openai.yaml'), 'utf8');
+  assert.match(interfaceYaml, /^\s*display_name:\s*"Universal Agent Bridge"$/m);
+  assert.match(interfaceYaml, /\$universal-agent-bridge/);
+});
+
+test('keeps v0.5.0 release metadata aligned', async () => {
+  const packageJson = JSON.parse(await readFile(join(repoRoot, 'package.json'), 'utf8'));
+  const pluginJson = JSON.parse(await readFile(join(repoRoot, '.codex-plugin', 'plugin.json'), 'utf8'));
+  const version = (await readFile(join(repoRoot, 'VERSION'), 'utf8')).trim();
+
+  assert.equal(packageJson.version, '0.5.0');
+  assert.equal(pluginJson.version, '0.5.0');
+  assert.equal(version, '0.5.0');
+});
