@@ -9,3 +9,4 @@ import './package-layout.test.mjs';
 import './skill-discovery.test.mjs';
 import './validate-handoff.test.mjs';
 import './ws-transport.test.mjs';
+import './openai-api.test.mjs';
