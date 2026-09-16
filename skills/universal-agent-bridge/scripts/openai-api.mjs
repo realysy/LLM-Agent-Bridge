@@ -190,8 +190,143 @@ export class OpenAIApiServer {
           let body = '';
           req.on('data', (chunk) => { body += chunk; });
           req.on('end', async () => {
+            // 1. 解析请求体
+            let data;
             try {
-              const data = JSON.parse(body);
+              data = JSON.parse(body);
+            } catch (err) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                error: {
+                  message: 'Invalid JSON in request body',
+                  type: 'invalid_request_error',
+                  code: 'invalid_json',
+                }
+              }));
+              return;
+            }
+
+            const wantsStream = data.stream === true;
+
+            // ==================== 流式（SSE）分支 ====================
+            if (wantsStream) {
+              res.writeHead(200, {
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-cache, no-transform',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+                'Transfer-Encoding': 'chunked',
+              });
+
+              try { req.socket.setNoDelay(true); } catch {}
+              try { req.socket.setKeepAlive(true); } catch {}
+
+              const requestId = `chatcmpl-${Date.now()}-${++this.requestIdCounter}`;
+              const created = Math.floor(Date.now() / 1000);
+              const modelName = data.model || 'chatgpt-web';
+
+              // ⭐⭐⭐ 关键修复：用 res.on('close') 而非 req.on('close') ⭐⭐⭐
+              let aborted = false;
+              res.on('close', () => {
+                if (!res.writableEnded) {
+                  aborted = true;
+                  console.log(`[SSE-ABORT] client disconnected before response ended`);
+                }
+              });
+
+              const writeChunk = (delta, finishReason = null) => {
+                if (aborted) {
+                  console.log(`[SSE-WRITE] skipped (aborted=true), finish_reason=${finishReason}`);
+                  return false;
+                }
+                const chunk = {
+                  id: requestId,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model: modelName,
+                  choices: [{
+                    index: 0,
+                    delta,
+                    finish_reason: finishReason,
+                  }],
+                };
+                const line = `data: ${JSON.stringify(chunk)}\n\n`;
+                try {
+                  res.write(line);
+                  console.log(`[SSE-WRITE] ${new Date().toISOString()} wrote ${line.length} bytes, finish_reason=${finishReason}`);
+                  return true;
+                } catch (e) {
+                  console.error(`[SSE-WRITE] failed:`, e);
+                  aborted = true;
+                  return false;
+                }
+              };
+
+              const writeDone = () => {
+                if (res.writableEnded) {
+                  console.log(`[SSE-DONE] already ended`);
+                  return;
+                }
+                try {
+                  res.write('data: [DONE]\n\n');
+                  console.log(`[SSE-DONE] wrote [DONE], calling res.end()`);
+                  res.end();
+                  console.log(`[SSE-DONE] res.end() called`);
+                } catch (e) {
+                  console.error(`[SSE-DONE] failed:`, e);
+                }
+              };
+
+              try {
+                // 1. 角色起始帧
+                writeChunk({ role: 'assistant', content: '' });
+
+                // 2. 阻塞等 bridge 返回完整内容（这是异步的，中间可能几分钟）
+                const result = await this.handleChatCompletion(data);
+                console.log(`[SSE] Got result, content length=${result.choices?.[0]?.message?.content?.length || 0}`);
+                const content = result.choices?.[0]?.message?.content || '';
+
+                // 3. 分片推送
+                const CHUNK_SIZE = 20;
+                if (content.length > 0) {
+                  for (let i = 0; i < content.length; i += CHUNK_SIZE) {
+                    if (aborted) break;
+                    writeChunk({ content: content.slice(i, i + CHUNK_SIZE) });
+                  }
+                }
+                console.log(`[SSE] Sending ${Math.ceil(content.length / 20)} chunks, then stop frame + [DONE]`);
+
+                // 4. finish_reason: stop
+                writeChunk({}, 'stop');
+
+                // 5. usage（可选）
+                if (data.stream_options?.include_usage) {
+                  const usageChunk = {
+                    id: requestId,
+                    object: 'chat.completion.chunk',
+                    created,
+                    model: modelName,
+                    choices: [],
+                    usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                  };
+                  if (!aborted) res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+                }
+
+                // 6. 结束
+                writeDone();
+              } catch (err) {
+                console.error(`[SSE-ERROR]`, err.message);
+                if (!aborted) {
+                  writeChunk({ content: `\n[Error: ${err.message || 'Internal server error'}]` }, null);
+                  writeChunk({}, 'stop');
+                }
+                writeDone();
+              }
+              return;
+            }
+
+            // ==================== 非流式分支（原有逻辑） ====================
+            try {
               const result = await this.handleChatCompletion(data);
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify(result));
@@ -241,6 +376,7 @@ export class OpenAIApiServer {
           const taskIdx = this.queuedTasks.findIndex(t => !t.targetPlatform || t.targetPlatform === 'auto' || t.targetPlatform === platform);
           if (taskIdx !== -1) {
             const task = this.queuedTasks.splice(taskIdx, 1)[0];
+            console.log(`[Poll] DELIVER task requestId=${task.request_id} to platform=${platform}`);
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ task }));
             return;
@@ -298,6 +434,7 @@ export class OpenAIApiServer {
               const data = JSON.parse(body);
               const { request_id, type, payload } = data;
               if (request_id && this.pendingRequests.has(request_id)) {
+                console.log(`[Result] RECEIVED requestId=${request_id}, type=${type}, content len=${payload?.content?.length || 0}`);
                 const { resolve, reject } = this.pendingRequests.get(request_id);
                 this.pendingRequests.delete(request_id);
                 if (type === 'REASONING_RESULT') {
@@ -305,6 +442,8 @@ export class OpenAIApiServer {
                 } else {
                   reject(new Error(payload?.error || 'Reasoning failed in browser'));
                 }
+              } else {
+                console.warn(`[Result] UNKNOWN requestId=${request_id} (already timed out or dup)`);
               }
               res.writeHead(200, { 'Content-Type': 'application/json' });
               res.end(JSON.stringify({ ok: true }));
@@ -441,7 +580,7 @@ export class OpenAIApiServer {
     // Execute via bridge - pass prompt as plain string for browser to inject
     const result = await this.executeHandoff(prompt, { 
       platform: platformId,
-      timeout: 180,
+      timeout: 280,
     });
 
     // Generate OpenAI-compatible response
@@ -628,13 +767,18 @@ export class OpenAIApiServer {
     const timeoutMs = (options.timeout || 180) * 1000;
     const targetPlatform = options.platform || 'auto';
 
+    console.log(`[Handoff] START platform=${targetPlatform} timeout=${options.timeout}s`);
+
     if (!this.isBrowserConnected(targetPlatform)) {
+      console.error(`[Handoff] NO BROWSER for platform=${targetPlatform}`);
       throw new Error(`NEEDS_BROWSER_CONNECTION: No active browser tab connected for platform [${targetPlatform}]. Please open the platform in your browser with the bridge userscript active.`);
     }
 
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    
-    // Handle both string prompts and packet objects
+    console.log(`[Handoff] requestId=${requestId}`);
+
+    // ⭐⭐ 关键：这一段之前被误删了，必须补回来 ⭐⭐
+    // 构建要发给浏览器的任务包
     const isStringPrompt = typeof packetContent === 'string';
     const taskPayload = {
       type: 'EXECUTE_REASONING',
@@ -645,45 +789,52 @@ export class OpenAIApiServer {
         model: options.model || null,
       },
     };
+    // ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(requestId);
+        console.error(`[Handoff] TIMEOUT requestId=${requestId}`);
         reject(new Error(`Timeout: Reasoning did not complete within ${options.timeout || 180}s`));
       }, timeoutMs);
 
       this.pendingRequests.set(requestId, {
         resolve: (result) => {
+          console.log(`[Handoff] RESOLVED requestId=${requestId}, content len=${result?.content?.length || 0}`);
           clearTimeout(timer);
           resolve(result);
         },
         reject: (err) => {
+          console.error(`[Handoff] REJECTED requestId=${requestId}:`, err.message);
           clearTimeout(timer);
           reject(err);
         },
       });
 
-      // Priority 1: Check WebSocket clients
+      // Priority 1: WebSocket clients
       for (const client of this.clients) {
         if (targetPlatform === 'auto' || client.platform === targetPlatform) {
+          console.log(`[Handoff] DISPATCH via WebSocket to ${client.platform}`);
           this.send(client, taskPayload);
           return;
         }
       }
 
-      // Priority 2: Check HTTP Long-Poll waiters
+      // Priority 2: HTTP long-poll waiters
       for (const [pId, list] of this.httpPollWaiters.entries()) {
         if ((targetPlatform === 'auto' || pId === targetPlatform) && list.length > 0) {
           const waiter = list.shift();
           clearTimeout(waiter.timer);
           waiter.res.writeHead(200, { 'Content-Type': 'application/json' });
           waiter.res.end(JSON.stringify({ task: taskPayload }));
+          console.log(`[Handoff] DISPATCH via HTTP long-poll waiter, platform=${pId}`);
           return;
         }
       }
 
       // Priority 3: Enqueue for next incoming poll
       this.queuedTasks.push(taskPayload);
+      console.log(`[Handoff] ENQUEUED requestId=${requestId}, queue size=${this.queuedTasks.length}`);
     });
   }
 }

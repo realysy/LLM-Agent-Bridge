@@ -252,6 +252,38 @@ test.describe('OpenAI API 兼容性测试', () => {
       // 验证请求被正确处理
       assert.ok(response.statusCode !== 400);
     });
+
+    test('流式模式应返回 SSE 且以 finish_reason:stop 结束', async () => {
+      const http = await import('node:http');
+      const raw = await new Promise((resolve, reject) => {
+        const req = http.request(`${BASE_URL}/v1/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${API_KEY}`,
+          },
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => resolve({ statusCode: res.statusCode, headers: res.headers, body: data }));
+        });
+        req.on('error', reject);
+        req.write(JSON.stringify({
+          model: 'deepseek-web',
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: true,
+        }));
+        req.end();
+      });
+
+      assert.strictEqual(raw.statusCode, 200);
+      assert.match(raw.headers['content-type'] || '', /text\/event-stream/);
+
+      // 无论 bridge 是否可用，SSE 协议层必须完整：
+      // 必须包含 [DONE]，且 finish_reason 必须存在
+      assert.ok(raw.body.includes('data: [DONE]'));
+      assert.ok(/"finish_reason"\s*:\s*"stop"/.test(raw.body));
+    });
     
     test('应支持 temperature 参数', async () => {
       const response = await httpRequest('/v1/chat/completions', {
