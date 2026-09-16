@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.8
+// @version      0.5.9
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -47,6 +47,7 @@
   let BASE_HTTP = localStorage.getItem(STORAGE_KEY) || DEFAULT_BASE_HTTP;
   let statusBadge = null;
   let settingsPanel = null;
+  let badgeContainer = null;
   let isExecuting = false;
   let isPolling = false;
 
@@ -285,11 +286,79 @@
     }
   }
 
+  // 当前 badge 位置（比例），供窗口尺寸变化时重新映射到新视口。
+  // null 表示尚未定位，使用默认右上角。
+  let badgePosition = null;
+
+  // 应用 badgePosition 到当前视口尺寸；若尚未有值，保持默认右上角。
+  function applyBadgePosition() {
+    if (!badgeContainer) return;
+    if (!badgePosition) return;
+    const width = badgeContainer.offsetWidth;
+    const height = badgeContainer.offsetHeight;
+    // 面板展开时的高度可能远大于 badge 本体，用 badge 本体尺寸做 clamp 基准，
+    // 面板是否出界由 clampPanelDirection 单独处理。
+    const maxX = Math.max(1, window.innerWidth - width);
+    const maxY = Math.max(1, window.innerHeight - height);
+    const left = clamp(badgePosition.x * maxX, 0, maxX);
+    const top = clamp(badgePosition.y * maxY, 0, maxY);
+    badgeContainer.style.left = `${left}px`;
+    badgeContainer.style.top = `${top}px`;
+    badgeContainer.style.right = 'auto';
+  }
+
+  // 让设置面板不超出视口：
+  // - 水平：根据 badge 在视口中的位置选择面板靠左/靠右对齐（只动面板，不动 badge）
+  // - 垂直：若面板底部会超出视口，则用负 margin-top 把面板往上顶
+  // - 宽度：面板比视口还宽时限制最大宽度
+  function clampPanelPosition() {
+    if (!badgeContainer || !settingsPanel) return;
+    if (settingsPanel.style.display === 'none') return;
+
+    // 先复位到初始态，方便测量
+    settingsPanel.style.marginTop = '0';
+    settingsPanel.style.marginLeft = '0';
+    settingsPanel.style.marginRight = '0';
+    settingsPanel.style.maxWidth = '';
+    settingsPanel.style.alignSelf = '';
+
+    const rect = badgeContainer.getBoundingClientRect();
+    const panelRect = settingsPanel.getBoundingClientRect();
+    const margin = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // 水平：若面板从 badge 右侧向外展开会溢出视口，则改成往左展开（靠右对齐）。
+    // 这里用 alignSelf 只影响面板，不会推动 badge。
+    const wouldOverflowRight = rect.right + (panelRect.width - rect.width) > vw - margin;
+    const wouldOverflowLeft = rect.left - (panelRect.width - rect.width) < margin;
+    if (wouldOverflowRight && !wouldOverflowLeft) {
+      settingsPanel.style.alignSelf = 'flex-end';
+    } else if (wouldOverflowLeft && !wouldOverflowRight) {
+      settingsPanel.style.alignSelf = 'flex-start';
+    } else if (wouldOverflowRight && wouldOverflowLeft) {
+      // 两边都会溢出，居中，并限制宽度
+      settingsPanel.style.alignSelf = 'center';
+    }
+
+    // 垂直：面板在 badge 下方，若底部超出视口，向上顶回视口内
+    const overflowBottom = panelRect.bottom - (vh - margin);
+    if (overflowBottom > 0) {
+      const maxLift = Math.max(0, rect.top - margin);
+      settingsPanel.style.marginTop = `-${Math.min(overflowBottom, maxLift)}px`;
+    }
+
+    // 面板比视口还宽，限制最大宽度
+    if (panelRect.width > vw - margin * 2) {
+      settingsPanel.style.maxWidth = `${vw - margin * 2}px`;
+    }
+  }
+
   // 1. Create floating UI badge with settings panel
   function createBadge() {
     if (document.getElementById('agent-bridge-badge')) return;
 
-    const badgeContainer = document.createElement('div');
+    badgeContainer = document.createElement('div');
     badgeContainer.id = 'agent-bridge-badge';
     // 容器定位在右上角，badge 固定在首行，设置面板显示时向下展开，
     // 因此容器的 top 值始终保持不变，badge 视觉位置不受面板显隐影响。
@@ -318,8 +387,9 @@
       alignItems: 'center',
       gap: '6px',
       transition: 'all 0.3s ease',
-      cursor: 'pointer',
+      cursor: 'grab',
       userSelect: 'none',
+      touchAction: 'none',
       whiteSpace: 'nowrap',
     });
     statusBadge.title = `Click to open settings (${currentPlatform.name})`;
@@ -433,6 +503,9 @@
         input.value = BASE_HTTP;
         input.focus();
         input.select();
+        // 面板显示后立即调整方向与位置；再在下一帧补一次，等布局稳定
+        clampPanelPosition();
+        requestAnimationFrame(clampPanelPosition);
       }
     };
 
@@ -441,6 +514,114 @@
         settingsPanel.style.display = 'none';
       }
     });
+
+    // ---- 拖动 badge 改变位置；仅在超过阈值的水平/垂直位移后才视为拖动 ----
+    // 位置以视口比例（0~1）存入 localStorage，跨分辨率时不会落到屏幕外。
+    (function enableDrag() {
+      let dragging = false;
+      let moved = false;
+      let startX = 0;
+      let startY = 0;
+      let startLeft = 0;
+      let startTop = 0;
+
+      const onPointerDown = (e) => {
+        // 只响应主键/触摸，左键拖拽；点在面板内部的输入控件上时不触发拖动
+        if (e.button !== undefined && e.button !== 0) return;
+        if (settingsPanel && settingsPanel.contains(e.target)) return;
+        if (e.target.closest && e.target.closest('input, textarea, button')) return;
+
+        dragging = true;
+        moved = false;
+        startX = e.clientX;
+        startY = e.clientY;
+        const rect = badgeContainer.getBoundingClientRect();
+        startLeft = rect.left;
+        startTop = rect.top;
+
+        // 拖动前先清掉过渡，避免跟手
+        badgeContainer.style.transition = 'none';
+        badgeContainer.style.userSelect = 'none';
+
+        window.addEventListener('pointermove', onPointerMove);
+        window.addEventListener('pointerup', onPointerUp);
+        window.addEventListener('pointercancel', onPointerUp);
+      };
+
+      const onPointerMove = (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        if (!moved && Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+        moved = true;
+
+        const width = badgeContainer.offsetWidth;
+        const height = badgeContainer.offsetHeight;
+        const left = clamp(startLeft + dx, 0, window.innerWidth - width);
+        const top = clamp(startTop + dy, 0, window.innerHeight - height);
+
+        badgeContainer.style.left = `${left}px`;
+        badgeContainer.style.top = `${top}px`;
+        badgeContainer.style.right = 'auto';
+      };
+
+      const onPointerUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        window.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', onPointerUp);
+        window.removeEventListener('pointercancel', onPointerUp);
+
+        badgeContainer.style.userSelect = '';
+        badgeContainer.style.transition = 'all 0.3s ease';
+
+        if (moved) {
+          const rect = badgeContainer.getBoundingClientRect();
+          const maxX = Math.max(1, window.innerWidth - rect.width);
+          const maxY = Math.max(1, window.innerHeight - rect.height);
+          badgePosition = { x: rect.left / maxX, y: rect.top / maxY };
+          saveBadgePosition(badgePosition.x, badgePosition.y);
+          badgeContainer.dataset.justDragged = '1';
+          setTimeout(() => delete badgeContainer.dataset.justDragged, 0);
+        }
+      };
+
+      statusBadge.addEventListener('pointerdown', onPointerDown);
+    })();
+
+    // 窗口尺寸变化时，按新视口重新映射比例位置；同时重新 clamp 面板方向
+    window.addEventListener('resize', () => {
+      applyBadgePosition();
+      requestAnimationFrame(() => {
+        applyBadgePosition();
+        clampPanelPosition();
+      });
+    });
+
+    // badge 自身尺寸变化（例如窄屏省略平台名前缀）也要重新 clamp
+    if (typeof ResizeObserver !== 'undefined') {
+      const ro = new ResizeObserver(() => {
+        applyBadgePosition();
+        clampPanelPosition();
+      });
+      ro.observe(badgeContainer);
+    }
+
+    // 应用已保存的位置；没有保存过则保持默认（右上角）
+    requestAnimationFrame(() => {
+      badgePosition = loadBadgePosition();
+      if (badgePosition) {
+        applyBadgePosition();
+      }
+    });
+
+    // 拖动刚结束的那一次 click 不触发展开面板
+    statusBadge.addEventListener('click', (e) => {
+      if (badgeContainer.dataset.justDragged) {
+        e.stopPropagation();
+        e.preventDefault();
+      }
+    }, true);
   }
 
   // 窄屏阈值：窗口宽度小于该值时，精简 badge
@@ -474,6 +655,41 @@
       updateBadge(lastBadgeRender.status, lastBadgeRender.text, lastBadgeRender.tooltip);
     }
   });
+
+  // Badge 拖动后的自定义位置（百分比，相对视口左上角；null 表示用默认右上角）
+  const BADGE_POSITION_KEY = 'agent_bridge_badge_position';
+  const DRAG_THRESHOLD_PX = 4;  // 超过此位移才算拖动，避免误伤点击展开面板
+
+  function loadBadgePosition() {
+    try {
+      const raw = localStorage.getItem(BADGE_POSITION_KEY);
+      if (!raw) return null;
+      const pos = JSON.parse(raw);
+      if (typeof pos?.x !== 'number' || typeof pos?.y !== 'number') return null;
+      // 数值是 0~1 的比例，避免分辨率变化后落到屏幕外
+      if (pos.x < 0 || pos.x > 1 || pos.y < 0 || pos.y > 1) return null;
+      return pos;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveBadgePosition(xRatio, yRatio) {
+    try {
+      localStorage.setItem(
+        BADGE_POSITION_KEY,
+        JSON.stringify({ x: xRatio, y: yRatio })
+      );
+    } catch (e) {
+      /* 存储失败不影响使用 */
+    }
+  }
+
+  function clamp(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+
 
   // 安全调用平台适配器方法：任何异常都不应中断 Bridge 主循环
   function safeCall(fn, fallback, label) {
