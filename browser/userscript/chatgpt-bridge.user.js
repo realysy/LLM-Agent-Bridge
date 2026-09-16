@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.5
+// @version      0.5.6
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -51,6 +51,17 @@
   let isPolling = false;
 
   // Platform Adapters
+  function hasButtonWithText(text) {
+    try {
+      for (const el of document.querySelectorAll('button, [role="button"], a')) {
+        const t = (el.textContent || '').trim();
+        if (t === text || t.includes(text)) return true;
+      }
+    } catch (e) {
+      // 忽略遍历异常，视为未找到
+    }
+    return false;
+  }
   const PLATFORMS = {
     chatgpt: {
       id: 'chatgpt',
@@ -116,7 +127,7 @@
       stop: 'div[class*="stop"], button[class*="stop"]',
       assistant: '.markdown___, div[class*="chat-message-assistant"], div[class*="segment-assistant"], div[class*="chat-content"], div[class*="markdown"]',
       model: () => document.querySelector('div[class*="model-switcher"] span, div[class*="tag"], div[class*="model-name"]')?.textContent.trim() || 'Kimi k1.5',
-      isLogin: () => !document.querySelector('button:contains("登录"), div[class*="login"], a[href*="login"]'),
+      isLogin: () => !document.querySelector('div[class*="login"], a[href*="login"]') && !hasButtonWithText('登录'),
     },
     grok: {
       id: 'grok',
@@ -138,7 +149,7 @@
       stop: 'div[class*="stop-btn"], button[class*="stop"]',
       assistant: '.tongyi-ui-markdown, div[class*="contentWrapper"], div[class*="markdown"]',
       model: () => document.querySelector('div[class*="model-name"], span[class*="modelTag"]')?.textContent.trim() || 'Qwen 2.5 Max/Plus',
-      isLogin: () => !document.querySelector('.login-btn, button:contains("登录")'),
+      isLogin: () => !document.querySelector('.login-btn') && !hasButtonWithText('登录'),
     },
     doubao: {
       id: 'doubao',
@@ -149,7 +160,7 @@
       stop: 'button[class*="stop"], div[class*="stop-btn"]',
       assistant: 'div[data-testid="receive_message"], div[class*="message-receive"], .markdown-body',
       model: () => document.querySelector('div[class*="model-select"] span, div[class*="model-item"]')?.textContent.trim() || 'Doubao-Pro',
-      isLogin: () => !document.querySelector('button:contains("登录"), div[class*="login"]'),
+      isLogin: () => !document.querySelector('div[class*="login"]') && !hasButtonWithText('登录'),
     },
     glm: {
       id: 'glm',
@@ -160,7 +171,7 @@
       stop: '.stop-btn, button:has(svg.stop-icon)',
       assistant: '.markdown-body, div[class*="bubble-content-assistant"], .chat-item-assistant',
       model: () => document.querySelector('div[class*="model-select"] span, div[class*="current-model"]')?.textContent.trim() || 'GLM-4',
-      isLogin: () => !document.querySelector('.login-btn, button:contains("登录")'),
+      isLogin: () => !document.querySelector('.login-btn') && !hasButtonWithText('登录'),
     },
   };
 
@@ -418,12 +429,30 @@
     }
   }
 
+  // 安全调用平台适配器方法：任何异常都不应中断 Bridge 主循环
+  function safeCall(fn, fallback, label) {
+    try {
+      return fn();
+    } catch (e) {
+      console.warn(`[AgentBridge:${currentPlatform.name}] adapter ${label} failed:`, e);
+      return fallback;
+    }
+  }
+
   function getPageState() {
     return {
       platform: currentPlatform.id,
       platform_name: currentPlatform.name,
-      isLogin: currentPlatform.isLogin ? currentPlatform.isLogin() : true,
-      currentModel: currentPlatform.model ? currentPlatform.model() : 'Kimi',
+      isLogin: safeCall(
+        () => currentPlatform.isLogin ? currentPlatform.isLogin() : true,
+        true,
+        'isLogin'
+      ),
+      currentModel: safeCall(
+        () => currentPlatform.model ? currentPlatform.model() : 'Kimi',
+        'Unknown',
+        'model'
+      ),
     };
   }
 
