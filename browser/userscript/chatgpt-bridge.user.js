@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
-// @namespace    https://github.com/anightmonarch/codex-bridge-chatgpt
-// @version      0.5.2
+// @namespace    https://github.com/realysy/LLM-Agent-Bridge
+// @version      0.5.4
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
-// @author       Universal Agent Community
+// @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @match        https://claude.ai/*
@@ -22,7 +22,10 @@
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
+// @connect      10.0.2.2
 // @run-at       document-idle
+// @downloadURL https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
+// @updateURL https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
 // ==/UserScript==
 
 (function () {
@@ -37,7 +40,11 @@
     return;
   }
 
-  const BASE_HTTP = 'http://127.0.0.1:8765';
+  // Configuration: Load from LocalStorage or use default
+  const DEFAULT_BASE_HTTP = 'http://127.0.0.1:8765';
+  const STORAGE_KEY = 'agent_bridge_base_url';
+  
+  let BASE_HTTP = localStorage.getItem(STORAGE_KEY) || DEFAULT_BASE_HTTP;
   let statusBadge = null;
   let isExecuting = false;
   let isPolling = false;
@@ -301,7 +308,7 @@
         }
       } catch (err) {
         console.warn(`[AgentBridge:${currentPlatform.name}] Loop connection error:`, err);
-        updateBadge('disconnected', 'Waiting for Agent...', 'Run: npm run bridge in local agent repo');
+        updateBadge('disconnected', 'Waiting for Agent...', 'Run: npm run api in local agent repo');
         await new Promise(r => setTimeout(r, 4000));
       }
     }
@@ -332,20 +339,25 @@
         throw new Error(`Could not find ${currentPlatform.name} prompt input area.`);
       }
 
+      // Handle both string prompts and packet objects (backward compatibility)
+      const promptText = typeof payload.packet === 'string' 
+        ? payload.packet 
+        : (payload.packet?.content?.instruction || JSON.stringify(payload.packet));
+
       // Universal Input injection
       inputEl.focus();
       if (inputEl.tagName === 'TEXTAREA') {
         const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
         if (nativeInputValueSetter) {
-          nativeInputValueSetter.call(inputEl, payload.packet);
+          nativeInputValueSetter.call(inputEl, promptText);
         } else {
-          inputEl.value = payload.packet;
+          inputEl.value = promptText;
         }
         inputEl.dispatchEvent(new Event('input', { bubbles: true }));
         inputEl.dispatchEvent(new Event('change', { bubbles: true }));
       } else {
         document.execCommand('selectAll', false, null);
-        document.execCommand('insertText', false, payload.packet);
+        document.execCommand('insertText', false, promptText);
       }
 
       await new Promise((r) => setTimeout(r, 600));

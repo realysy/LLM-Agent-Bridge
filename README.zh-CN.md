@@ -76,6 +76,28 @@ node skills/universal-agent-bridge/scripts/ws-transport.mjs send packet.md resul
 node skills/universal-agent-bridge/scripts/ws-transport.mjs send packet.md result.md --platform deepseek
 ```
 
+### OpenAI 兼容 API 模式
+
+将 Bridge 作为 OpenAI 兼容的 LLM API 服务器使用，支持任何 OpenAI SDK 客户端：
+
+```bash
+# 启动 OpenAI 兼容 API 服务器
+npm run api
+# 或
+node skills/universal-agent-bridge/scripts/openai-api.mjs serve --port 8765 --api-key sk-bridge-local-key
+
+# 列出可用模型
+curl http://localhost:8765/v1/models -H "Authorization: Bearer sk-bridge-local-key"
+
+# 聊天补全接口
+curl http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer sk-bridge-local-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "chatgpt-web", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+完整用法及 Python/Node.js SDK 集成示例请参阅 [OpenAI API 文档](skills/universal-agent-bridge/references/openai-api.md)。
+
 ---
 
 ## 工作原理

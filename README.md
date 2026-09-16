@@ -75,6 +75,28 @@ node skills/universal-agent-bridge/scripts/ws-transport.mjs send packet.md resul
 node skills/universal-agent-bridge/scripts/ws-transport.mjs send packet.md result.md --platform deepseek
 ```
 
+### OpenAI-Compatible API Mode
+
+Use the bridge as an OpenAI-compatible LLM API server for any OpenAI SDK client:
+
+```bash
+# Start OpenAI-compatible API server
+npm run api
+# or
+node skills/universal-agent-bridge/scripts/openai-api.mjs serve --port 8765 --api-key sk-bridge-local-key
+
+# List available models
+curl http://localhost:8765/v1/models -H "Authorization: Bearer sk-bridge-local-key"
+
+# Chat completions
+curl http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer sk-bridge-local-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "chatgpt-web", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+See [OpenAI API Documentation](skills/universal-agent-bridge/references/openai-api.md) for full usage with Python/Node.js SDKs.
+
 ---
 
 ## How it works
