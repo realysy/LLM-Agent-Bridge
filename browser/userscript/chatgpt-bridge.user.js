@@ -46,6 +46,7 @@
   
   let BASE_HTTP = localStorage.getItem(STORAGE_KEY) || DEFAULT_BASE_HTTP;
   let statusBadge = null;
+  let settingsPanel = null;
   let isExecuting = false;
   let isPolling = false;
 
@@ -78,7 +79,7 @@
       name: 'DeepSeek',
       matches: ['chat.deepseek.com'],
       input: 'textarea#chat-input, textarea.chat-input, textarea',
-      send: 'div[role="button"]:has(svg), div#chat-input-send-button, div[class*="send-button"], button:has(svg)',
+      send: 'div#chat-input-send-button, div[class*="send-button"]:has(svg), div.send-btn:has(svg), button:has(svg path[d*="M11.748 6.7028"])',
       stop: 'div[role="button"]:has(svg.ds-icon-stop), div[class*="stop-button"]',
       assistant: '.ds-markdown, .ds-message-assistant, div[class*="ds-message"]:not([class*="user"])',
       model: () => document.querySelector('.ds-dropdown-value, div[class*="model-name"]')?.textContent.trim() || 'DeepSeek-V3/R1',
@@ -210,16 +211,27 @@
     });
   }
 
-  // 1. Create floating UI badge
+  // 1. Create floating UI badge with settings panel
   function createBadge() {
     if (document.getElementById('agent-bridge-badge')) return;
-    statusBadge = document.createElement('div');
-    statusBadge.id = 'agent-bridge-badge';
-    Object.assign(statusBadge.style, {
+    
+    // Create badge container
+    const badgeContainer = document.createElement('div');
+    badgeContainer.id = 'agent-bridge-badge';
+    Object.assign(badgeContainer.style, {
       position: 'fixed',
       top: '12px',
       right: '80px',
       zIndex: '999999',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'flex-end',
+      gap: '4px',
+    });
+    
+    // Create status badge
+    statusBadge = document.createElement('div');
+    Object.assign(statusBadge.style, {
       padding: '4px 12px',
       borderRadius: '16px',
       fontSize: '12px',
@@ -235,11 +247,105 @@
       cursor: 'pointer',
       userSelect: 'none',
     });
-    statusBadge.title = `Click to reconnect to local Agent Bridge (${currentPlatform.name})`;
-    statusBadge.onclick = () => {
-      startBridgeLoop();
+    statusBadge.title = `Click to open settings (${currentPlatform.name})`;
+    
+    // Create settings panel (hidden by default)
+    settingsPanel = document.createElement('div');
+    Object.assign(settingsPanel.style, {
+      display: 'none',
+      padding: '10px 12px',
+      borderRadius: '8px',
+      fontSize: '11px',
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      color: '#374151',
+      backgroundColor: '#f9fafb',
+      border: '1px solid #e5e7eb',
+      boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+      minWidth: '200px',
+    });
+    
+    // Settings row: BASE_HTTP label + input
+    const settingsRow = document.createElement('div');
+    Object.assign(settingsRow.style, {
+      display: 'flex',
+      alignItems: 'center',
+      gap: '8px',
+      marginBottom: '4px',
+    });
+    
+    const label = document.createElement('span');
+    label.textContent = 'BASE_HTTP:';
+    label.style.fontWeight = '600';
+    label.style.whiteSpace = 'nowrap';
+    
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = BASE_HTTP;
+    input.placeholder = DEFAULT_BASE_HTTP;
+    Object.assign(input.style, {
+      flex: '1',
+      padding: '4px 8px',
+      fontSize: '11px',
+      border: '1px solid #d1d5db',
+      borderRadius: '4px',
+      outline: 'none',
+    });
+    input.onfocus = () => input.style.borderColor = '#4b5563';
+    input.onblur = () => input.style.borderColor = '#d1d5db';
+    input.onchange = () => {
+      const val = input.value.trim();
+      if (val) {
+        BASE_HTTP = val;
+        localStorage.setItem(STORAGE_KEY, val);
+      }
     };
-    document.body.appendChild(statusBadge);
+    
+    const saveBtn = document.createElement('button');
+    saveBtn.textContent = 'Save';
+    saveBtn.style.padding = '4px 8px';
+    saveBtn.style.fontSize = '11px';
+    saveBtn.style.backgroundColor = '#10a37f';
+    saveBtn.style.color = '#fff';
+    saveBtn.style.border = 'none';
+    saveBtn.style.borderRadius = '4px';
+    saveBtn.style.cursor = 'pointer';
+    saveBtn.onclick = () => {
+      const val = input.value.trim();
+      if (val) {
+        BASE_HTTP = val;
+        localStorage.setItem(STORAGE_KEY, val);
+        saveBtn.textContent = 'Saved!';
+        setTimeout(() => saveBtn.textContent = 'Save', 1000);
+      }
+    };
+    
+    settingsRow.appendChild(label);
+    settingsRow.appendChild(input);
+    settingsRow.appendChild(saveBtn);
+    settingsPanel.appendChild(settingsRow);
+    
+    badgeContainer.appendChild(settingsPanel);
+    badgeContainer.appendChild(statusBadge);
+    document.body.appendChild(badgeContainer);
+    
+    // Toggle settings panel on badge click
+    statusBadge.onclick = (e) => {
+      e.stopPropagation();
+      const isVisible = settingsPanel.style.display === 'block';
+      settingsPanel.style.display = isVisible ? 'none' : 'block';
+      if (!isVisible) {
+        input.value = BASE_HTTP;
+        input.focus();
+        input.select();
+      }
+    };
+    
+    // Close panel when clicking outside
+    document.addEventListener('click', (e) => {
+      if (!badgeContainer.contains(e.target)) {
+        settingsPanel.style.display = 'none';
+      }
+    });
   }
 
   function updateBadge(status, text, tooltip = '') {
