@@ -12,7 +12,8 @@
     "test": "node tests/run-all.mjs",
     "doctor": "node skills/universal-agent-bridge/scripts/doctor.mjs --json",
     "verify": "node scripts/verify.mjs",
-    "bridge": "node skills/universal-agent-bridge/scripts/ws-transport.mjs serve"
+    "bridge": "node skills/universal-agent-bridge/scripts/ws-transport.mjs serve",
+    "api": "node skills/universal-agent-bridge/scripts/openai-api.mjs serve"
   },
   "engines": {
     "node": ">=18"
