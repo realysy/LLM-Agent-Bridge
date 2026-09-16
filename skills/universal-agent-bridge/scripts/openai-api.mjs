@@ -438,23 +438,8 @@ export class OpenAIApiServer {
     // Convert messages to a prompt string
     const prompt = this.messagesToPrompt(messages);
 
-    // Create a context packet for the bridge
-    const packet = {
-      type: 'CONTEXT_PACKET',
-      version: '1.0',
-      timestamp: new Date().toISOString(),
-      content: {
-        instruction: prompt,
-        evidence: [],
-        constraints: {
-          max_tokens: max_tokens || 4096,
-          temperature: temperature || 0.7,
-        },
-      },
-    };
-
-    // Execute via bridge
-    const result = await this.executeHandoff(packet, { 
+    // Execute via bridge - pass prompt as plain string for browser to inject
+    const result = await this.executeHandoff(prompt, { 
       platform: platformId,
       timeout: 180,
     });
@@ -648,12 +633,15 @@ export class OpenAIApiServer {
     }
 
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    
+    // Handle both string prompts and packet objects
+    const isStringPrompt = typeof packetContent === 'string';
     const taskPayload = {
       type: 'EXECUTE_REASONING',
       request_id: requestId,
       targetPlatform,
       payload: {
-        packet: packetContent,
+        packet: isStringPrompt ? packetContent : packetContent,
         model: options.model || null,
       },
     };
