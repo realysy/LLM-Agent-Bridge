@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.7
+// @version      0.5.8
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -291,6 +291,8 @@
 
     const badgeContainer = document.createElement('div');
     badgeContainer.id = 'agent-bridge-badge';
+    // 容器定位在右上角，badge 固定在首行，设置面板显示时向下展开，
+    // 因此容器的 top 值始终保持不变，badge 视觉位置不受面板显隐影响。
     Object.assign(badgeContainer.style, {
       position: 'fixed',
       top: '12px',
@@ -318,6 +320,7 @@
       transition: 'all 0.3s ease',
       cursor: 'pointer',
       userSelect: 'none',
+      whiteSpace: 'nowrap',
     });
     statusBadge.title = `Click to open settings (${currentPlatform.name})`;
 
@@ -332,15 +335,23 @@
       backgroundColor: '#f9fafb',
       border: '1px solid #e5e7eb',
       boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-      minWidth: '200px',
+      minWidth: '220px',
     });
 
+    // ---- 配置行容器：将来新增配置项时，往这里 append 新的 row 即可 ----
+    const settingsRows = document.createElement('div');
+    Object.assign(settingsRows.style, {
+      display: 'flex',
+      flexDirection: 'column',
+      gap: '8px',
+    });
+
+    // ---- 第 1 行：BASE_HTTP ----
     const settingsRow = document.createElement('div');
     Object.assign(settingsRow.style, {
       display: 'flex',
       alignItems: 'center',
       gap: '8px',
-      marginBottom: '4px',
     });
 
     const label = document.createElement('span');
@@ -354,6 +365,7 @@
     input.placeholder = DEFAULT_BASE_HTTP;
     Object.assign(input.style, {
       flex: '1',
+      minWidth: '0',
       padding: '4px 8px',
       fontSize: '11px',
       border: '1px solid #d1d5db',
@@ -370,9 +382,21 @@
       }
     };
 
+    settingsRow.appendChild(label);
+    settingsRow.appendChild(input);
+    settingsRows.appendChild(settingsRow);
+
+    // ---- 操作区：Save 按钮独立于配置行，始终位于所有配置项下方 ----
+    const settingsActions = document.createElement('div');
+    Object.assign(settingsActions.style, {
+      display: 'flex',
+      justifyContent: 'flex-end',
+      marginTop: '10px',
+    });
+
     const saveBtn = document.createElement('button');
     saveBtn.textContent = 'Save';
-    saveBtn.style.padding = '4px 8px';
+    saveBtn.style.padding = '4px 12px';
     saveBtn.style.fontSize = '11px';
     saveBtn.style.backgroundColor = '#10a37f';
     saveBtn.style.color = '#fff';
@@ -380,22 +404,25 @@
     saveBtn.style.borderRadius = '4px';
     saveBtn.style.cursor = 'pointer';
     saveBtn.onclick = () => {
+      // 集中收集所有配置项并持久化。
+      // 将来新增配置项时，只需在下面补充对应的收集/写回逻辑。
       const val = input.value.trim();
       if (val) {
         BASE_HTTP = val;
         localStorage.setItem(STORAGE_KEY, val);
-        saveBtn.textContent = 'Saved!';
-        setTimeout(() => saveBtn.textContent = 'Save', 1000);
       }
+      saveBtn.textContent = 'Saved!';
+      setTimeout(() => saveBtn.textContent = 'Save', 1000);
     };
+    settingsActions.appendChild(saveBtn);
 
-    settingsRow.appendChild(label);
-    settingsRow.appendChild(input);
-    settingsRow.appendChild(saveBtn);
-    settingsPanel.appendChild(settingsRow);
+    settingsPanel.appendChild(settingsRows);
+    settingsPanel.appendChild(settingsActions);
 
-    badgeContainer.appendChild(settingsPanel);
+    // 关键顺序：statusBadge 先 append，settingsPanel 后 append，
+    // 使 badge 始终固定在容器首行，设置面板向下展开而不顶开 badge。
     badgeContainer.appendChild(statusBadge);
+    badgeContainer.appendChild(settingsPanel);
     document.body.appendChild(badgeContainer);
 
     statusBadge.onclick = (e) => {
@@ -416,6 +443,10 @@
     });
   }
 
+  // 窄屏阈值：窗口宽度小于该值时，精简 badge
+  const NARROW_VIEWPORT_PX = 640;
+  // 缓存最近一次渲染入参，供窗口尺寸变化时按新宽度重新渲染。
+  let lastBadgeRender = null;
   function updateBadge(status, text, tooltip = '') {
     if (!statusBadge) createBadge();
     const colors = {
@@ -426,11 +457,23 @@
     };
     const c = colors[status] || colors.disconnected;
     statusBadge.style.backgroundColor = c.bg;
-    statusBadge.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c.dot};"></span> ${currentPlatform.name} Bridge: ${text}`;
+    // 窄屏时省略平台名前缀，只保留状态文案，避免 badge 过长挤压页面
+    const label = window.innerWidth < NARROW_VIEWPORT_PX
+      ? text
+      : `${currentPlatform.name} Bridge: ${text}`;
+    statusBadge.innerHTML = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c.dot};"></span> ${label}`;
     if (tooltip) {
       statusBadge.title = tooltip;
     }
+    lastBadgeRender = { status, text, tooltip };
   }
+
+  // 窗口尺寸变化时按新宽度重新渲染 badge（只影响文案，不影响 badge 位置）
+  window.addEventListener('resize', () => {
+    if (lastBadgeRender) {
+      updateBadge(lastBadgeRender.status, lastBadgeRender.text, lastBadgeRender.tooltip);
+    }
+  });
 
   // 安全调用平台适配器方法：任何异常都不应中断 Bridge 主循环
   function safeCall(fn, fallback, label) {
@@ -570,6 +613,9 @@
       });
 
       const sendBtn = findVisible(currentPlatform.send) || document.querySelector(currentPlatform.send);
+      if (sendBtn) {
+        sendBtn.click();
+      }
 
       // Fallback: send Enter keydown
       inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
