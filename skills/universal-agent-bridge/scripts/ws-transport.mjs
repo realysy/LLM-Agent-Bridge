@@ -268,7 +268,7 @@ export class BridgeServer {
         });
       });
 
-      this.server.listen(this.port, '127.0.0.1', () => {
+      this.server.listen(this.port, '0.0.0.0', () => {
         resolveStart(this);
       });
 
@@ -509,7 +509,7 @@ Commands:
   if (command === 'serve') {
     const server = new BridgeServer(port);
     await server.start();
-    console.log(`[BridgeServer] Listening on http/ws://127.0.0.1:${port}`);
+    console.log(`[BridgeServer] Listening on http/ws://0.0.0.0:${port}`);
     console.log(`[BridgeServer] Ready for ChatGPT / Claude / DeepSeek / Gemini / Kimi / Grok / Qwen / Doubao / GLM connections.`);
     return;
   }
@@ -591,7 +591,7 @@ Commands:
       isTemporaryServer = true;
       server = new BridgeServer(port);
       await server.start();
-      console.log(`[BridgeServer] Started temporary bridge on ws/http://127.0.0.1:${port}`);
+      console.log(`[BridgeServer] Started temporary bridge on ws/http://0.0.0.0:${port}`);
 
       // Check if any tab connects immediately within 1.5 seconds before launching browser
       const alreadyOpen = await new Promise((resolveQuick) => {
