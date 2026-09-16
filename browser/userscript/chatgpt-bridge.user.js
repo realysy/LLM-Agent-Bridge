@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.6
+// @version      0.5.7
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -90,18 +90,18 @@
       name: 'DeepSeek',
       matches: ['chat.deepseek.com'],
       input: 'textarea#chat-input, textarea.chat-input, textarea',
-      // 发送按钮：保留原逻辑，同时兼容新结构
-      send: 'div.ds-button--primary button.ds-button__icon, div[class*="send"]:has(svg path[d*="M8.3125 0.980206"]), button:has(svg path[d*="M8.3125 0.980206"])',
-      // 停止按钮：基于你提供的实际 HTML 结构
-      // <div role="button" class="ds-button ds-button--primary ds-button--filled ds-button--circle ...">
-      //   <svg><path d="M2 4.88C2 3.68009 ..."></path></svg>
-      // </div>
+      // 发送按钮：ds-button--primary 圆形图标按钮，内含向上箭头 svg（path d 以 "M8.3125" 开头）
+      // 输入框为空时同一元素会额外带 ds-button--disabled / 无 tabindex，必须排除，
+      // 否则会点到灰色按钮导致 click 无效。
+      send: [
+        'div[role="button"].ds-button--primary:not(.ds-button--disabled):has(svg path[d^="M8.3125"])',
+        'div[role="button"].ds-button--primary:not(.ds-button--disabled):has(svg path[d*="M8.3125 0.980206"])',
+      ].join(', '),
+      // 停止按钮：同一位置但 svg path 换成方形（d 以 "M2 4.88" 开头）。
+      // 用 :has() 精确匹配 path 前缀，避免和发送按钮混淆。
       stop: [
-        'div[role="button"].ds-button--circle:has(svg path[d^="M2 4.88"])',
         'div[role="button"].ds-button--primary:has(svg path[d^="M2 4.88"])',
-        'button.ds-button--iconLabelTertiary:has(svg path[d*="M2 4.88"])',
-        'div[role="button"]:has(svg.ds-icon-stop)',
-        'div[class*="stop-button"]',
+        'div[role="button"].ds-button--circle:has(svg path[d^="M2 4.88"])',
       ].join(', '),
       assistant: '.ds-markdown, .ds-message-assistant, div[class*="ds-message"]:not([class*="user"])',
       model: () => document.querySelector('.ds-dropdown-value, div[class*="model-name"]')?.textContent.trim() || 'DeepSeek-V3/R1',
@@ -144,9 +144,12 @@
       id: 'qwen',
       name: 'Qwen',
       matches: ['tongyi.aliyun.com', 'chat.qwen.ai'],
-      input: 'textarea[placeholder*="问"], textarea#chat-textarea, div[contenteditable="true"], textarea',
-      send: 'div[class*="operateBtn"] button, div[class*="send-btn"], button:has(svg)',
-      stop: 'div[class*="stop-btn"], button[class*="stop"]',
+      input: 'textarea#chat-textarea, textarea[placeholder*="问"], div[contenteditable="true"], textarea',
+      // 发送按钮：button.send-button，禁用态会带 disabled 属性 + disabled class，
+      // 必须排除，否则空输入时命中灰色按钮，click 无效。
+      send: 'button.send-button:not([disabled]):not(.disabled)',
+      // 停止按钮：button.stop-button（带 aria-label="停止"）
+      stop: 'button.stop-button',
       assistant: '.tongyi-ui-markdown, div[class*="contentWrapper"], div[class*="markdown"]',
       model: () => document.querySelector('div[class*="model-name"], span[class*="modelTag"]')?.textContent.trim() || 'Qwen 2.5 Max/Plus',
       isLogin: () => !document.querySelector('.login-btn') && !hasButtonWithText('登录'),
@@ -546,12 +549,27 @@
         document.execCommand('insertText', false, promptText);
       }
 
-      await new Promise((r) => setTimeout(r, 600));
+      // 现代框架（React/Vue）在 input 事件后会异步把内容同步回受控组件，
+      // 给一帧时间即可；用最短 120ms + 最多 600ms 的轮询代替固定 600ms 硬等。
+      // 新选择器已排除 disabled 态，只要 findVisible 命中即视为按钮就绪。
+      await new Promise((resolve) => {
+        const started = Date.now();
+        const minWait = 120;
+        const maxWait = 600;
+        const step = 60;
+        const tick = () => {
+          const elapsed = Date.now() - started;
+          const ready = !!findVisible(currentPlatform.send);
+          if (elapsed >= minWait && (ready || elapsed >= maxWait)) {
+            resolve();
+            return;
+          }
+          setTimeout(tick, step);
+        };
+        tick();
+      });
 
       const sendBtn = findVisible(currentPlatform.send) || document.querySelector(currentPlatform.send);
-      if (sendBtn) {
-        sendBtn.click();
-      }
 
       // Fallback: send Enter keydown
       inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
@@ -651,16 +669,29 @@
     return (last.innerText || last.textContent || '').trim();
   }
 
-  // Wait for completion: 基于新回答 diff + 可见停止按钮 + 文本稳定 + 最小等待时间
+  /**
+  * Wait for completion: 基于新回答 diff + 可见停止按钮 + 文本稳定 + 最小等待时间
+  * 
+  * 参数调优说明：
+  * - interval 800→400，stableChecks 4→2：秒回场景从 ~3.2s 降到 ~0.8s；
+  *   仍能过滤掉 SSE 分片抖动（相邻两次 400ms 采样文本完全一致）。
+  * - noStopGraceMs 2500→1200：仅当整个响应周期里一次都没看到过停止按钮时才生效，
+  *   用于兜底那些秒回、停止按钮根本没渲染的平台（如 Qwen "hi"）。
+  * - 新增 hardStableMs = 4000：即使一直能看到停止按钮，只要文本连续 4s 不变也判完成，
+  *   避免某些平台停止按钮改成“重新生成”后一直挂着导致永久挂起。
+  */
   function waitForCompletion({ beforeSnapshot, sentAt, timeoutMs = 300000 } = {}) {
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
-      const minGenerationMs = 1500;      // 至少等 1.5s，避免秒回还没渲染完就判定稳定
-      const requiredStableChecks = 4;    // 连续 4 次（800ms * 4 ≈ 3.2s）文本不变才算完成
-      const noStopGraceMs = 2500;        // 若从没见过停止按钮，至少等 2.5s 再考虑"无停止"完成
+      const minGenerationMs = 500;       // 响应刚开始后的最小观察窗
+      const requiredStableChecks = 2;    // 连续 2 次（400ms * 2 ≈ 0.8s）文本不变即完成
+      const noStopGraceMs = 1200;        // 未见过停止按钮时的兜底等待
+      const hardStableMs = 4000;         // 见得到停止按钮但文本长期不变 => 也判完成
+      const CHECK_INTERVAL_MS = 400;
 
       let streamStableCount = 0;
       let lastText = '';
+      let lastChangeAt = 0;              // 最后一次文本发生变化的时间
       let hadVisibleStopButton = false;
       let responseStarted = false;
       let responseStartedAt = 0;
@@ -680,6 +711,7 @@
             responseStarted = true;
             responseStartedAt = now;
             lastText = getLatestAssistantText();
+            lastChangeAt = now;
             console.log(`[AgentBridge:${currentPlatform.name}] Response started. initial text length: ${lastText.length}`);
           }
           return; // 还没开始就继续等
@@ -688,33 +720,39 @@
         // 2) 最小等待时间，避免秒回被过早判定
         if (now - responseStartedAt < minGenerationMs) return;
 
-        // 3) 可见停止按钮检测
+        const currentText = getLatestAssistantText();
+
+        // 3) 文本变化跟踪
+        if (currentText !== lastText) {
+          lastText = currentText;
+          lastChangeAt = now;
+          streamStableCount = 0;
+        }
+
+        // 4) 可见停止按钮检测
         const stopBtn = findVisible(currentPlatform.stop);
         if (stopBtn) {
           hadVisibleStopButton = true;
-          // 生成中：文本仍在变，重置稳定计数
-          const cur = getLatestAssistantText();
-          if (cur.length !== lastText.length) {
-            lastText = cur;
+          // 停止按钮仍在：正常生成中，继续等
+          // 但若文本已长期不变（部分平台停止按钮不会自动消失），走 hardStableMs 兜底
+          if (currentText && now - lastChangeAt >= hardStableMs) {
+            clearInterval(checkInterval);
+            console.log(`[AgentBridge:${currentPlatform.name}] Completion detected (hard-stable ${hardStableMs}ms, stop btn still visible).`);
+            resolve(currentText);
           }
-          streamStableCount = 0;
           return;
         }
 
-        // 4) 无可见停止按钮
-        const currentText = getLatestAssistantText();
-
-        // 没有文本，继续等
+        // 5) 无可见停止按钮
         if (!currentText) return;
 
         // 如果从没见过停止按钮，至少要等 noStopGraceMs 才允许判定（防止误判）
         if (!hadVisibleStopButton && now - responseStartedAt < noStopGraceMs) {
-          lastText = currentText;
           return;
         }
 
-        // 5) 文本稳定性判定
-        if (currentText.length === lastText.length && currentText === lastText) {
+        // 6) 文本稳定性判定
+        if (currentText === lastText) {
           streamStableCount++;
           console.log(`[AgentBridge:${currentPlatform.name}] Stable check ${streamStableCount}/${requiredStableChecks}, len=${currentText.length}`);
           if (streamStableCount >= requiredStableChecks) {
@@ -725,8 +763,9 @@
         } else {
           streamStableCount = 0;
           lastText = currentText;
+          lastChangeAt = now;
         }
-      }, 800);
+      }, CHECK_INTERVAL_MS);
     });
   }
 
