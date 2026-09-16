@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.4
+// @version      0.5.5
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -24,8 +24,8 @@
 // @connect      localhost
 // @connect      10.0.2.2
 // @run-at       document-idle
-// @downloadURL https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
-// @updateURL https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
+// @downloadURL  https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
+// @updateURL    https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
 // ==/UserScript==
 
 (function () {
@@ -43,7 +43,7 @@
   // Configuration: Load from LocalStorage or use default
   const DEFAULT_BASE_HTTP = 'http://127.0.0.1:8765';
   const STORAGE_KEY = 'agent_bridge_base_url';
-  
+
   let BASE_HTTP = localStorage.getItem(STORAGE_KEY) || DEFAULT_BASE_HTTP;
   let statusBadge = null;
   let settingsPanel = null;
@@ -79,8 +79,19 @@
       name: 'DeepSeek',
       matches: ['chat.deepseek.com'],
       input: 'textarea#chat-input, textarea.chat-input, textarea',
+      // 发送按钮：保留原逻辑，同时兼容新结构
       send: 'div.ds-button--primary button.ds-button__icon, div[class*="send"]:has(svg path[d*="M8.3125 0.980206"]), button:has(svg path[d*="M8.3125 0.980206"])',
-      stop: 'button.ds-button--iconLabelTertiary:has(svg path[d*="square"]), div[role="button"]:has(svg.ds-icon-stop), div[class*="stop-button"]',
+      // 停止按钮：基于你提供的实际 HTML 结构
+      // <div role="button" class="ds-button ds-button--primary ds-button--filled ds-button--circle ...">
+      //   <svg><path d="M2 4.88C2 3.68009 ..."></path></svg>
+      // </div>
+      stop: [
+        'div[role="button"].ds-button--circle:has(svg path[d^="M2 4.88"])',
+        'div[role="button"].ds-button--primary:has(svg path[d^="M2 4.88"])',
+        'button.ds-button--iconLabelTertiary:has(svg path[d*="M2 4.88"])',
+        'div[role="button"]:has(svg.ds-icon-stop)',
+        'div[class*="stop-button"]',
+      ].join(', '),
       assistant: '.ds-markdown, .ds-message-assistant, div[class*="ds-message"]:not([class*="user"])',
       model: () => document.querySelector('.ds-dropdown-value, div[class*="model-name"]')?.textContent.trim() || 'DeepSeek-V3/R1',
       isLogin: () => !document.querySelector('div[class*="login-btn"], a[href*="/login"]'),
@@ -165,7 +176,36 @@
 
   const currentPlatform = getCurrentPlatform();
 
-  // Robust cross-environment HTTP requester
+  // ---- Utility: visibility check ----
+  function isElementVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.display === 'none') return false;
+    if (style.visibility === 'hidden') return false;
+    if (parseFloat(style.opacity || '1') === 0) return false;
+    if (el.getClientRects().length === 0) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    return true;
+  }
+
+  // Find first *visible* element matching selector
+  function findVisible(selector) {
+    if (!selector) return null;
+    let nodes;
+    try {
+      nodes = document.querySelectorAll(selector);
+    } catch (e) {
+      return null;
+    }
+    for (const el of nodes) {
+      if (isElementVisible(el)) return el;
+    }
+    return null;
+  }
+
+  // ---- Robust request with timeout on both GM_xmlhttpRequest and fetch ----
   function request(options) {
     return new Promise((resolve, reject) => {
       let gmHttp = null;
@@ -175,13 +215,15 @@
         gmHttp = GM.xmlHttpRequest;
       }
 
+      const timeout = options.timeout || 30000;
+
       if (gmHttp) {
         gmHttp({
           method: options.method || 'GET',
           url: options.url,
           headers: { 'Content-Type': 'application/json' },
           data: options.data ? JSON.stringify(options.data) : undefined,
-          timeout: options.timeout || 30000,
+          timeout: timeout,
           onload: (res) => {
             try {
               const data = JSON.parse(res.responseText || '{}');
@@ -199,23 +241,40 @@
           },
         });
       } else {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeout);
         fetch(options.url, {
           method: options.method || 'GET',
           headers: { 'Content-Type': 'application/json' },
           body: options.data ? JSON.stringify(options.data) : undefined,
+          signal: controller.signal,
         })
           .then(r => r.json())
           .then(resolve)
-          .catch(reject);
+          .catch(reject)
+          .finally(() => clearTimeout(timer));
       }
     });
+  }
+
+  // Safely report result/error, never let it block badge updates
+  async function safeReport(body, timeoutMs = 5000) {
+    try {
+      await Promise.race([
+        request({ url: `${BASE_HTTP}/result`, method: 'POST', data: body, timeout: timeoutMs }),
+        new Promise((_, rj) => setTimeout(() => rj(new Error('report timeout')), timeoutMs + 500)),
+      ]);
+      return true;
+    } catch (e) {
+      console.warn(`[AgentBridge:${currentPlatform.name}] report failed:`, e);
+      return false;
+    }
   }
 
   // 1. Create floating UI badge with settings panel
   function createBadge() {
     if (document.getElementById('agent-bridge-badge')) return;
-    
-    // Create badge container
+
     const badgeContainer = document.createElement('div');
     badgeContainer.id = 'agent-bridge-badge';
     Object.assign(badgeContainer.style, {
@@ -228,8 +287,7 @@
       alignItems: 'flex-end',
       gap: '4px',
     });
-    
-    // Create status badge
+
     statusBadge = document.createElement('div');
     Object.assign(statusBadge.style, {
       padding: '4px 12px',
@@ -248,8 +306,7 @@
       userSelect: 'none',
     });
     statusBadge.title = `Click to open settings (${currentPlatform.name})`;
-    
-    // Create settings panel (hidden by default)
+
     settingsPanel = document.createElement('div');
     Object.assign(settingsPanel.style, {
       display: 'none',
@@ -263,8 +320,7 @@
       boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
       minWidth: '200px',
     });
-    
-    // Settings row: BASE_HTTP label + input
+
     const settingsRow = document.createElement('div');
     Object.assign(settingsRow.style, {
       display: 'flex',
@@ -272,12 +328,12 @@
       gap: '8px',
       marginBottom: '4px',
     });
-    
+
     const label = document.createElement('span');
     label.textContent = 'BASE_HTTP:';
     label.style.fontWeight = '600';
     label.style.whiteSpace = 'nowrap';
-    
+
     const input = document.createElement('input');
     input.type = 'text';
     input.value = BASE_HTTP;
@@ -299,7 +355,7 @@
         localStorage.setItem(STORAGE_KEY, val);
       }
     };
-    
+
     const saveBtn = document.createElement('button');
     saveBtn.textContent = 'Save';
     saveBtn.style.padding = '4px 8px';
@@ -318,17 +374,16 @@
         setTimeout(() => saveBtn.textContent = 'Save', 1000);
       }
     };
-    
+
     settingsRow.appendChild(label);
     settingsRow.appendChild(input);
     settingsRow.appendChild(saveBtn);
     settingsPanel.appendChild(settingsRow);
-    
+
     badgeContainer.appendChild(settingsPanel);
     badgeContainer.appendChild(statusBadge);
     document.body.appendChild(badgeContainer);
-    
-    // Toggle settings panel on badge click
+
     statusBadge.onclick = (e) => {
       e.stopPropagation();
       const isVisible = settingsPanel.style.display === 'block';
@@ -339,8 +394,7 @@
         input.select();
       }
     };
-    
-    // Close panel when clicking outside
+
     document.addEventListener('click', (e) => {
       if (!badgeContainer.contains(e.target)) {
         settingsPanel.style.display = 'none';
@@ -385,7 +439,6 @@
       try {
         const state = getPageState();
 
-        // 1. Send Heartbeat
         await request({
           url: `${BASE_HTTP}/heartbeat`,
           method: 'POST',
@@ -401,7 +454,6 @@
 
         updateBadge('connected', 'Ready', `Connected as ${currentPlatform.name} Provider`);
 
-        // 2. Long Poll for tasks
         const response = await request({
           url: `${BASE_HTTP}/poll?platform=${currentPlatform.id}`,
           method: 'GET',
@@ -420,17 +472,13 @@
     }
   }
 
-  // 4. Inject prompt & extract result
+// 4. Inject prompt & extract result
   async function handleReasoningRequest(requestId, payload) {
     if (isExecuting) {
-      await request({
-        url: `${BASE_HTTP}/result`,
-        method: 'POST',
-        data: {
-          request_id: requestId,
-          type: 'REASONING_ERROR',
-          payload: { error: `${currentPlatform.name} tab is already processing another reasoning request.` },
-        },
+      await safeReport({
+        request_id: requestId,
+        type: 'REASONING_ERROR',
+        payload: { error: `${currentPlatform.name} tab is already processing another reasoning request.` },
       });
       return;
     }
@@ -439,16 +487,19 @@
     updateBadge('busy', 'Reasoning...', 'Executing agent task');
 
     try {
-      const inputEl = document.querySelector(currentPlatform.input);
+      const inputEl = findVisible(currentPlatform.input) || document.querySelector(currentPlatform.input);
 
       if (!inputEl) {
         throw new Error(`Could not find ${currentPlatform.name} prompt input area.`);
       }
 
-      // Handle both string prompts and packet objects (backward compatibility)
-      const promptText = typeof payload.packet === 'string' 
-        ? payload.packet 
+      const promptText = typeof payload.packet === 'string'
+        ? payload.packet
         : (payload.packet?.content?.instruction || JSON.stringify(payload.packet));
+
+      // ---- 发送前快照：assistant 消息数量 + 最后一条文本 ----
+      const beforeSnapshot = captureAssistantSnapshot();
+      console.log(`[AgentBridge:${currentPlatform.name}] Snapshot before send:`, beforeSnapshot);
 
       // Universal Input injection
       inputEl.focus();
@@ -468,9 +519,7 @@
 
       await new Promise((r) => setTimeout(r, 600));
 
-      // Click send button
-      const sendBtn = document.querySelector(currentPlatform.send) || inputEl.parentElement?.querySelector('button');
-
+      const sendBtn = findVisible(currentPlatform.send) || document.querySelector(currentPlatform.send);
       if (sendBtn) {
         sendBtn.click();
       }
@@ -478,86 +527,175 @@
       // Fallback: send Enter keydown
       inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
 
+      // 记录发送时刻，供最小等待使用
+      const sentAt = Date.now();
+
       // Wait for completion
-      const resultMarkdown = await waitForCompletion();
+      const resultMarkdown = await waitForCompletion({ beforeSnapshot, sentAt });
       const state = getPageState();
 
-      await request({
-        url: `${BASE_HTTP}/result`,
-        method: 'POST',
-        data: {
-          type: 'REASONING_RESULT',
-          request_id: requestId,
-          payload: {
-            content: resultMarkdown,
-            platform: currentPlatform.id,
-            platform_name: currentPlatform.name,
-            model: state.currentModel,
-            timestamp: new Date().toISOString(),
-          },
+      updateBadge('busy', 'Reporting...', 'Sending result to agent');
+
+      const ok = await safeReport({
+        type: 'REASONING_RESULT',
+        request_id: requestId,
+        payload: {
+          content: resultMarkdown,
+          platform: currentPlatform.id,
+          platform_name: currentPlatform.name,
+          model: state.currentModel,
+          timestamp: new Date().toISOString(),
         },
       });
 
-      updateBadge('connected', 'Ready', 'Task completed');
+      if (ok) {
+        updateBadge('connected', 'Ready', 'Task completed');
+      } else {
+        updateBadge('error', 'Report Failed', 'Could not POST result to agent');
+      }
     } catch (err) {
       console.error(`[AgentBridge:${currentPlatform.name}] Execution error:`, err);
-      await request({
-        url: `${BASE_HTTP}/result`,
-        method: 'POST',
-        data: {
-          type: 'REASONING_ERROR',
-          request_id: requestId,
-          payload: { error: err.message },
-        },
+
+      await safeReport({
+        type: 'REASONING_ERROR',
+        request_id: requestId,
+        payload: { error: err.message },
       });
+
       updateBadge('error', 'Execution Failed', err.message);
     } finally {
       isExecuting = false;
+      try {
+        if (statusBadge && /Reasoning|Reporting/.test(statusBadge.textContent || '')) {
+          updateBadge('connected', 'Ready', 'Task finished (fallback)');
+        }
+      } catch (e) { /* noop */ }
     }
   }
 
-  function waitForCompletion(timeoutMs = 180000) {
+  // 抓取当前 assistant 消息快照
+  function captureAssistantSnapshot() {
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(currentPlatform.assistant));
+    } catch (e) {
+      nodes = [];
+    }
+    const last = nodes[nodes.length - 1] || null;
+    return {
+      count: nodes.length,
+      lastText: last ? (last.innerText || last.textContent || '').trim() : '',
+    };
+  }
+
+  // 判定"本次回答是否已经开始"
+  function hasNewResponseStarted(before) {
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(currentPlatform.assistant));
+    } catch (e) {
+      return false;
+    }
+    if (nodes.length === 0) return false;
+
+    // 消息数量变多 => 新回答
+    if (nodes.length > before.count) return true;
+
+    // 最后一条文本变了 => 本次回答已经开始（秒回场景很常见）
+    const last = nodes[nodes.length - 1];
+    const lastText = (last.innerText || last.textContent || '').trim();
+    if (lastText && lastText !== before.lastText) return true;
+
+    return false;
+  }
+
+  // 取当前最新 assistant 消息文本
+  function getLatestAssistantText() {
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll(currentPlatform.assistant));
+    } catch (e) {
+      return '';
+    }
+    const last = nodes[nodes.length - 1];
+    if (!last) return '';
+    return (last.innerText || last.textContent || '').trim();
+  }
+
+  // Wait for completion: 基于新回答 diff + 可见停止按钮 + 文本稳定 + 最小等待时间
+  function waitForCompletion({ beforeSnapshot, sentAt, timeoutMs = 300000 } = {}) {
     return new Promise((resolve, reject) => {
       const startTime = Date.now();
+      const minGenerationMs = 1500;      // 至少等 1.5s，避免秒回还没渲染完就判定稳定
+      const requiredStableChecks = 4;    // 连续 4 次（800ms * 4 ≈ 3.2s）文本不变才算完成
+      const noStopGraceMs = 2500;        // 若从没见过停止按钮，至少等 2.5s 再考虑"无停止"完成
+
       let streamStableCount = 0;
-      let lastTextLength = 0;
-      let hadStopButton = false;
+      let lastText = '';
+      let hadVisibleStopButton = false;
+      let responseStarted = false;
+      let responseStartedAt = 0;
 
       const checkInterval = setInterval(() => {
-        if (Date.now() - startTime > timeoutMs) {
+        const now = Date.now();
+
+        if (now - startTime > timeoutMs) {
           clearInterval(checkInterval);
           reject(new Error(`Timeout waiting for ${currentPlatform.name} response.`));
           return;
         }
 
-        const stopBtn = document.querySelector(currentPlatform.stop);
-        const assistantMessages = document.querySelectorAll(currentPlatform.assistant);
-        const latestMessage = assistantMessages[assistantMessages.length - 1];
-
-        if (!latestMessage) return;
-
-        const currentText = latestMessage.innerText || latestMessage.textContent;
-
-        // Track if stop button appeared during streaming (indicates active generation)
-        if (stopBtn) {
-          hadStopButton = true;
+        // 1) 是否已经开始新回答
+        if (!responseStarted) {
+          if (hasNewResponseStarted(beforeSnapshot)) {
+            responseStarted = true;
+            responseStartedAt = now;
+            lastText = getLatestAssistantText();
+            console.log(`[AgentBridge:${currentPlatform.name}] Response started. initial text length: ${lastText.length}`);
+          }
+          return; // 还没开始就继续等
         }
 
-        // Completion detection: stop button disappeared after appearing, OR text stable for multiple checks
-        const stopButtonGone = hadStopButton && !stopBtn;
-        const textIsLongEnough = currentText.length > 50;
+        // 2) 最小等待时间，避免秒回被过早判定
+        if (now - responseStartedAt < minGenerationMs) return;
 
-        if (stopButtonGone || (textIsLongEnough && !stopBtn)) {
-          if (currentText.length === lastTextLength) {
-            streamStableCount++;
-            if (streamStableCount >= 2) {
-              clearInterval(checkInterval);
-              resolve(currentText);
-            }
-          } else {
-            streamStableCount = 0;
-            lastTextLength = currentText.length;
+        // 3) 可见停止按钮检测
+        const stopBtn = findVisible(currentPlatform.stop);
+        if (stopBtn) {
+          hadVisibleStopButton = true;
+          // 生成中：文本仍在变，重置稳定计数
+          const cur = getLatestAssistantText();
+          if (cur.length !== lastText.length) {
+            lastText = cur;
           }
+          streamStableCount = 0;
+          return;
+        }
+
+        // 4) 无可见停止按钮
+        const currentText = getLatestAssistantText();
+
+        // 没有文本，继续等
+        if (!currentText) return;
+
+        // 如果从没见过停止按钮，至少要等 noStopGraceMs 才允许判定（防止误判）
+        if (!hadVisibleStopButton && now - responseStartedAt < noStopGraceMs) {
+          lastText = currentText;
+          return;
+        }
+
+        // 5) 文本稳定性判定
+        if (currentText.length === lastText.length && currentText === lastText) {
+          streamStableCount++;
+          console.log(`[AgentBridge:${currentPlatform.name}] Stable check ${streamStableCount}/${requiredStableChecks}, len=${currentText.length}`);
+          if (streamStableCount >= requiredStableChecks) {
+            clearInterval(checkInterval);
+            console.log(`[AgentBridge:${currentPlatform.name}] Completion detected.`);
+            resolve(currentText);
+          }
+        } else {
+          streamStableCount = 0;
+          lastText = currentText;
         }
       }, 800);
     });
