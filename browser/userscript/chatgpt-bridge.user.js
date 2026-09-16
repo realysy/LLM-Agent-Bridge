@@ -79,8 +79,8 @@
       name: 'DeepSeek',
       matches: ['chat.deepseek.com'],
       input: 'textarea#chat-input, textarea.chat-input, textarea',
-      send: 'div#chat-input-send-button, div[class*="send-button"]:has(svg), div.send-btn:has(svg), button:has(svg path[d*="M11.748 6.7028"])',
-      stop: 'div[role="button"]:has(svg.ds-icon-stop), div[class*="stop-button"]',
+      send: 'div.ds-button--primary button.ds-button__icon, div[class*="send"]:has(svg path[d*="M8.3125 0.980206"]), button:has(svg path[d*="M8.3125 0.980206"])',
+      stop: 'button.ds-button--iconLabelTertiary:has(svg path[d*="square"]), div[role="button"]:has(svg.ds-icon-stop), div[class*="stop-button"]',
       assistant: '.ds-markdown, .ds-message-assistant, div[class*="ds-message"]:not([class*="user"])',
       model: () => document.querySelector('.ds-dropdown-value, div[class*="model-name"]')?.textContent.trim() || 'DeepSeek-V3/R1',
       isLogin: () => !document.querySelector('div[class*="login-btn"], a[href*="/login"]'),
@@ -521,6 +521,7 @@
       const startTime = Date.now();
       let streamStableCount = 0;
       let lastTextLength = 0;
+      let hadStopButton = false;
 
       const checkInterval = setInterval(() => {
         if (Date.now() - startTime > timeoutMs) {
@@ -537,7 +538,16 @@
 
         const currentText = latestMessage.innerText || latestMessage.textContent;
 
-        if (!stopBtn && currentText.length > 50) {
+        // Track if stop button appeared during streaming (indicates active generation)
+        if (stopBtn) {
+          hadStopButton = true;
+        }
+
+        // Completion detection: stop button disappeared after appearing, OR text stable for multiple checks
+        const stopButtonGone = hadStopButton && !stopBtn;
+        const textIsLongEnough = currentText.length > 50;
+
+        if (stopButtonGone || (textIsLongEnough && !stopBtn)) {
           if (currentText.length === lastTextLength) {
             streamStableCount++;
             if (streamStableCount >= 2) {
