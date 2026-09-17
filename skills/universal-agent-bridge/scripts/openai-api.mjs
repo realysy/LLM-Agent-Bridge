@@ -560,6 +560,7 @@ export class OpenAIApiServer {
     const {
       model = 'chatgpt-web',
       messages = [],
+      tools = null,
       temperature,
       max_tokens,
       stream = false,
@@ -567,14 +568,19 @@ export class OpenAIApiServer {
 
     // Map OpenAI model name to platform ID
     const platformId = this.modelToPlatform(model);
-    
-    // Convert messages to a prompt string
+
+    // Convert messages to a prompt string（保留作为 fallback / 兼容旧路径）
     const prompt = this.messagesToPrompt(messages);
+
+    // 拆分成带类型的 blocks，供浏览器端做增量去重。
+    // 网页对话自身保存历史，因此重复的 system / context / tools 不必每轮都注入。
+    const blocks = this.buildBlocks(messages, tools);
 
     // Execute via bridge - pass prompt as plain string for browser to inject
     const result = await this.executeHandoff(prompt, { 
       platform: platformId,
       timeout: 280,
+      blocks,
     });
 
     // Generate OpenAI-compatible response
@@ -632,6 +638,66 @@ export class OpenAIApiServer {
                       Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '';
       return `${role.toUpperCase()}: ${content}`;
     }).join('\n\n');
+  }
+
+  /**
+   * 把 messages 拆成带类型的 blocks，供浏览器端做增量去重。
+   *
+   * block kind 分类：
+   *   system  - role=system 的消息
+   *   tools   - 请求体顶层的 tools 数组（序列化后作为单个 block）
+   *   context - 非最后一条 role=user 的消息（历史 + 环境上下文等）
+   *   turn    - 最后一条 role=user 的消息（本次新问题，永不去重）
+   *
+   * assistant 消息一律忽略：网页对话本身已有历史，不需要重复注入。
+   *
+   * @param {Array} messages OpenAI 格式消息数组
+   * @param {Array} tools 可选的工具定义数组
+   * @returns {Array<{kind:string, content:string}>}
+   */
+  buildBlocks(messages, tools) {
+    const blocks = [];
+
+    const contentOf = (m) => {
+      const c = m?.content;
+      if (typeof c === 'string') return c;
+      if (Array.isArray(c)) {
+        return c.map((x) => (typeof x === 'string' ? x : x?.text || '')).join(' ');
+      }
+      return '';
+    };
+
+    // 1) system
+    for (const m of messages) {
+      if (m?.role !== 'system') continue;
+      const content = contentOf(m);
+      if (content) blocks.push({ kind: 'system', content });
+    }
+
+    // 2) tools（序列化后作为单个 block）
+    if (Array.isArray(tools) && tools.length > 0) {
+      blocks.push({ kind: 'tools', content: JSON.stringify(tools) });
+    }
+
+    // 3) 定位最后一条 user，用于区分 context / turn
+    let lastUserIdx = -1;
+    for (let i = 0; i < messages.length; i += 1) {
+      if (messages[i]?.role === 'user') lastUserIdx = i;
+    }
+
+    // 4) user 消息
+    for (let i = 0; i < messages.length; i += 1) {
+      const m = messages[i];
+      if (m?.role !== 'user') continue;
+      const content = contentOf(m);
+      if (!content) continue;
+      blocks.push({
+        kind: i === lastUserIdx ? 'turn' : 'context',
+        content,
+      });
+    }
+
+    return blocks;
   }
 
   /**
@@ -775,6 +841,10 @@ export class OpenAIApiServer {
       targetPlatform,
       payload: {
         packet: isStringPrompt ? packetContent : packetContent,
+        // 结构化 blocks；浏览器端按 kind 与内容哈希做增量去重。
+        // 若为 null（例如 ws-transport.mjs send 直接发 raw packet），
+        // 浏览器端会退回到 packet 路径，不做去重。
+        blocks: Array.isArray(options.blocks) ? options.blocks : null,
         model: options.model || null,
       },
     };
