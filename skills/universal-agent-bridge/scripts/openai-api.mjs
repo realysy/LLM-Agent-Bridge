@@ -253,7 +253,6 @@ export class OpenAIApiServer {
                 const line = `data: ${JSON.stringify(chunk)}\n\n`;
                 try {
                   res.write(line);
-                  console.log(`[SSE-WRITE] ${new Date().toISOString()} wrote ${line.length} bytes, finish_reason=${finishReason}`);
                   return true;
                 } catch (e) {
                   console.error(`[SSE-WRITE] failed:`, e);
@@ -269,9 +268,7 @@ export class OpenAIApiServer {
                 }
                 try {
                   res.write('data: [DONE]\n\n');
-                  console.log(`[SSE-DONE] wrote [DONE], calling res.end()`);
                   res.end();
-                  console.log(`[SSE-DONE] res.end() called`);
                 } catch (e) {
                   console.error(`[SSE-DONE] failed:`, e);
                 }
@@ -283,7 +280,6 @@ export class OpenAIApiServer {
 
                 // 2. 阻塞等 bridge 返回完整内容（这是异步的，中间可能几分钟）
                 const result = await this.handleChatCompletion(data);
-                console.log(`[SSE] Got result, content length=${result.choices?.[0]?.message?.content?.length || 0}`);
                 const content = result.choices?.[0]?.message?.content || '';
 
                 // 3. 分片推送
@@ -294,7 +290,6 @@ export class OpenAIApiServer {
                     writeChunk({ content: content.slice(i, i + CHUNK_SIZE) });
                   }
                 }
-                console.log(`[SSE] Sending ${Math.ceil(content.length / 20)} chunks, then stop frame + [DONE]`);
 
                 // 4. finish_reason: stop
                 writeChunk({}, 'stop');
@@ -434,7 +429,6 @@ export class OpenAIApiServer {
               const data = JSON.parse(body);
               const { request_id, type, payload } = data;
               if (request_id && this.pendingRequests.has(request_id)) {
-                console.log(`[Result] RECEIVED requestId=${request_id}, type=${type}, content len=${payload?.content?.length || 0}`);
                 const { resolve, reject } = this.pendingRequests.get(request_id);
                 this.pendingRequests.delete(request_id);
                 if (type === 'REASONING_RESULT') {
@@ -766,18 +760,13 @@ export class OpenAIApiServer {
   async executeHandoff(packetContent, options = {}) {
     const timeoutMs = (options.timeout || 180) * 1000;
     const targetPlatform = options.platform || 'auto';
-
-    console.log(`[Handoff] START platform=${targetPlatform} timeout=${options.timeout}s`);
-
     if (!this.isBrowserConnected(targetPlatform)) {
       console.error(`[Handoff] NO BROWSER for platform=${targetPlatform}`);
       throw new Error(`NEEDS_BROWSER_CONNECTION: No active browser tab connected for platform [${targetPlatform}]. Please open the platform in your browser with the bridge userscript active.`);
     }
 
     const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    console.log(`[Handoff] requestId=${requestId}`);
 
-    // ⭐⭐ 关键：这一段之前被误删了，必须补回来 ⭐⭐
     // 构建要发给浏览器的任务包
     const isStringPrompt = typeof packetContent === 'string';
     const taskPayload = {
@@ -789,7 +778,6 @@ export class OpenAIApiServer {
         model: options.model || null,
       },
     };
-    // ⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐⭐
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -800,7 +788,6 @@ export class OpenAIApiServer {
 
       this.pendingRequests.set(requestId, {
         resolve: (result) => {
-          console.log(`[Handoff] RESOLVED requestId=${requestId}, content len=${result?.content?.length || 0}`);
           clearTimeout(timer);
           resolve(result);
         },
@@ -814,7 +801,6 @@ export class OpenAIApiServer {
       // Priority 1: WebSocket clients
       for (const client of this.clients) {
         if (targetPlatform === 'auto' || client.platform === targetPlatform) {
-          console.log(`[Handoff] DISPATCH via WebSocket to ${client.platform}`);
           this.send(client, taskPayload);
           return;
         }
@@ -827,7 +813,6 @@ export class OpenAIApiServer {
           clearTimeout(waiter.timer);
           waiter.res.writeHead(200, { 'Content-Type': 'application/json' });
           waiter.res.end(JSON.stringify({ task: taskPayload }));
-          console.log(`[Handoff] DISPATCH via HTTP long-poll waiter, platform=${pId}`);
           return;
         }
       }
