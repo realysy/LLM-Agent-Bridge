@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.9
+// @version      0.5.10
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -24,8 +24,8 @@
 // @connect      localhost
 // @connect      10.0.2.2
 // @run-at       document-idle
-// @downloadURL  https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
-// @updateURL    https://github.com/realysy/LLM-Agent-Bridge/raw/refs/heads/main/browser/userscript/chatgpt-bridge.user.js
+// @downloadURL  https://raw.githubusercontent.com/realysy/LLM-Agent-Bridge/main/browser/userscript/chatgpt-bridge.user.js
+// @updateURL    https://raw.githubusercontent.com/realysy/LLM-Agent-Bridge/main/browser/userscript/chatgpt-bridge.user.js
 // ==/UserScript==
 
 (function () {
@@ -307,51 +307,61 @@
     badgeContainer.style.right = 'auto';
   }
 
-  // 让设置面板不超出视口：
-  // - 水平：根据 badge 在视口中的位置选择面板靠左/靠右对齐（只动面板，不动 badge）
-  // - 垂直：若面板底部会超出视口，则用负 margin-top 把面板往上顶
-  // - 宽度：面板比视口还宽时限制最大宽度
+  /**
+   * 让设置面板始终留在视口内，且不影响 badge 位置：
+   * - 水平：默认与 badge 左对齐（left: 0）；若右边缘会超出视口，整体向左平移
+   *         （给 left 一个负偏移），最左不超过视口左边距。
+   * - 垂直：默认从 badge 下方展开；若下边缘会超出视口，用负 marginTop 向上顶，
+   *         最上不超过视口上边距。
+   * - 尺寸：面板宽/高超过视口时用 maxWidth / maxHeight 限制，内容可滚动。
+   * 面板是 badgeContainer 的 absolute 子元素，本身不参与容器布局，
+   * 所以本函数不会移动 badge。
+   * @returns 
+   */
   function clampPanelPosition() {
     if (!badgeContainer || !settingsPanel) return;
     if (settingsPanel.style.display === 'none') return;
 
-    // 先复位到初始态，方便测量
-    settingsPanel.style.marginTop = '0';
-    settingsPanel.style.marginLeft = '0';
-    settingsPanel.style.marginRight = '0';
-    settingsPanel.style.maxWidth = '';
-    settingsPanel.style.alignSelf = '';
-
-    const rect = badgeContainer.getBoundingClientRect();
-    const panelRect = settingsPanel.getBoundingClientRect();
     const margin = 8;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
-    // 水平：若面板从 badge 右侧向外展开会溢出视口，则改成往左展开（靠右对齐）。
-    // 这里用 alignSelf 只影响面板，不会推动 badge。
-    const wouldOverflowRight = rect.right + (panelRect.width - rect.width) > vw - margin;
-    const wouldOverflowLeft = rect.left - (panelRect.width - rect.width) < margin;
-    if (wouldOverflowRight && !wouldOverflowLeft) {
-      settingsPanel.style.alignSelf = 'flex-end';
-    } else if (wouldOverflowLeft && !wouldOverflowRight) {
-      settingsPanel.style.alignSelf = 'flex-start';
-    } else if (wouldOverflowRight && wouldOverflowLeft) {
-      // 两边都会溢出，居中，并限制宽度
-      settingsPanel.style.alignSelf = 'center';
-    }
+    // 复位到初始态，得到"未 clamp"时的自然位置与尺寸
+    settingsPanel.style.left = '0';
+    settingsPanel.style.marginTop = '0';
+    settingsPanel.style.maxWidth = '';
+    settingsPanel.style.maxHeight = '';
+    settingsPanel.style.overflowY = '';
 
-    // 垂直：面板在 badge 下方，若底部超出视口，向上顶回视口内
-    const overflowBottom = panelRect.bottom - (vh - margin);
-    if (overflowBottom > 0) {
-      const maxLift = Math.max(0, rect.top - margin);
-      settingsPanel.style.marginTop = `-${Math.min(overflowBottom, maxLift)}px`;
-    }
-
-    // 面板比视口还宽，限制最大宽度
-    if (panelRect.width > vw - margin * 2) {
+    // 尺寸先 clamp，避免后面的偏移量基于过大的尺寸计算
+    let rect = settingsPanel.getBoundingClientRect();
+    if (rect.width > vw - margin * 2) {
       settingsPanel.style.maxWidth = `${vw - margin * 2}px`;
+      rect = settingsPanel.getBoundingClientRect();
     }
+    if (rect.height > vh - margin * 2) {
+      settingsPanel.style.maxHeight = `${vh - margin * 2}px`;
+      settingsPanel.style.overflowY = 'auto';
+      rect = settingsPanel.getBoundingClientRect();
+    }
+
+    // ---- 水平：默认与 badge 左对齐；右侧溢出则整体左移 ----
+    let offsetLeft = 0;
+    const overflowRight = rect.right - (vw - margin);
+    if (overflowRight > 0) offsetLeft -= overflowRight;
+    // 左边缘也不能越过视口左边距
+    const minOffsetLeft = margin - rect.left;
+    if (offsetLeft < minOffsetLeft) offsetLeft = minOffsetLeft;
+    settingsPanel.style.left = `${offsetLeft}px`;
+
+    // ---- 垂直：默认从 badge 下方展开；底部溢出则向上顶 ----
+    let offsetTop = 0;
+    const overflowBottom = rect.bottom - (vh - margin);
+    if (overflowBottom > 0) offsetTop -= overflowBottom;
+    // 上边缘也不能越过视口上边距
+    const minOffsetTop = margin - rect.top;
+    if (offsetTop < minOffsetTop) offsetTop = minOffsetTop;
+    settingsPanel.style.marginTop = `${offsetTop}px`;
   }
 
   // 1. Create floating UI badge with settings panel
@@ -367,10 +377,9 @@
       top: '12px',
       right: '80px',
       zIndex: '999999',
-      display: 'flex',
-      flexDirection: 'column',
-      alignItems: 'flex-end',
-      gap: '4px',
+      // 容器只承载 badge；设置面板改用 absolute 定位，不再参与流式布局，
+      // 因此容器尺寸固定为 badge 尺寸，面板展开/收起不会移动 badge。
+      display: 'block',
     });
 
     statusBadge = document.createElement('div');
@@ -397,6 +406,12 @@
     settingsPanel = document.createElement('div');
     Object.assign(settingsPanel.style, {
       display: 'none',
+      // 相对 badgeContainer 绝对定位：默认与 badge 左对齐（left: 0），
+      // 从 badge 底部下方 4px 处向下展开。右侧溢出时由 clampPanelPosition
+      // 直接把 left 调成负值向左平移。
+      position: 'absolute',
+      top: 'calc(100% + 4px)',
+      left: '0',
       padding: '10px 12px',
       borderRadius: '8px',
       fontSize: '11px',
@@ -406,6 +421,7 @@
       border: '1px solid #e5e7eb',
       boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
       minWidth: '220px',
+      zIndex: '1',
     });
 
     // ---- 配置行容器：将来新增配置项时，往这里 append 新的 row 即可 ----
@@ -583,6 +599,8 @@
           saveBadgePosition(badgePosition.x, badgePosition.y);
           badgeContainer.dataset.justDragged = '1';
           setTimeout(() => delete badgeContainer.dataset.justDragged, 0);
+          // 若面板正开着，按新位置重新 clamp
+          clampPanelPosition();
         }
       };
 
