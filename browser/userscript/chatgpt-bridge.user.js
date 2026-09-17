@@ -20,9 +20,7 @@
 // @match        https://chatglm.cn/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM.xmlHttpRequest
-// @connect      127.0.0.1
-// @connect      localhost
-// @connect      10.0.2.2
+// @connect      *
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/realysy/LLM-Agent-Bridge/main/browser/userscript/chatgpt-bridge.user.js
 // @updateURL    https://raw.githubusercontent.com/realysy/LLM-Agent-Bridge/main/browser/userscript/chatgpt-bridge.user.js
