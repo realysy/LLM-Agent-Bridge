@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.10
+// @version      0.5.11
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -944,13 +944,42 @@
         tick();
       });
 
+      /**
+       * 发送策略：优先 click 发送按钮，避免与 Enter fallback 同时触发。
+       *
+       * 早期版本会"既 click 又 dispatch Enter"，导致 DeepSeek 这类平台
+       * 在已有对话中把同一条消息发两次：click 已经触发发送，React 异步
+       * 清空输入框需要时间，此时 Enter 事件到达时 value 尚未清空，于是
+       * 被再次识别为一次发送。
+       *
+       * 现在改为：
+       *   1) 有发送按钮 → click 它，然后等输入框被清空（最长 250ms）。
+       *      被清空 => 发送已被接受，不再走 Enter。
+       *   2) 没按钮 / click 后输入框始终未清空 → 退回 Enter keydown 兜底。
+       */
       const sendBtn = findVisible(currentPlatform.send) || document.querySelector(currentPlatform.send);
+      let sent = false;
+
+      const readInputText = () =>
+        (inputEl.value !== undefined ? inputEl.value : inputEl.textContent || '').trim();
+
       if (sendBtn) {
-        sendBtn.click();
+        try {
+          sendBtn.click();
+          const started = Date.now();
+          while (Date.now() - started < 250) {
+            if (!readInputText()) { sent = true; break; }
+            await new Promise((r) => setTimeout(r, 50));
+          }
+        } catch (e) {
+          console.warn(`[AgentBridge:${currentPlatform.name}] send button click failed:`, e);
+        }
       }
 
-      // Fallback: send Enter keydown
-      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      // 仅在"没有发送按钮"或"click 后输入框未被清空"时，才退回 Enter。
+      if (!sent) {
+        inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      }
 
       // 记录发送时刻，供最小等待使用
       const sentAt = Date.now();
