@@ -22,15 +22,7 @@
 // @grant        GM.xmlHttpRequest
 // @connect      127.0.0.1
 // @connect      localhost
-// @connect      192.168.*
-// @connect      172.16.*
-// @connect      172.17.*
-// @connect      172.18.*
-// @connect      172.19.*
-// @connect      172.2?.*
-// @connect      172.30.*
-// @connect      172.31.*
-// @connect      10.0.*
+// @connect      10.0.2.2
 // @run-at       document-idle
 // @downloadURL  https://raw.githubusercontent.com/realysy/LLM-Agent-Bridge/main/browser/userscript/chatgpt-bridge.user.js
 // @updateURL    https://raw.githubusercontent.com/realysy/LLM-Agent-Bridge/main/browser/userscript/chatgpt-bridge.user.js
@@ -228,6 +220,98 @@
     return null;
   }
 
+
+  /**
+   * 检测 GM_xmlhttpRequest 的错误是否来自 userscript @connect 列表拦截。
+   * Tampermonkey 不同版本把拦截信息放在 err.error / err.message 里，
+   * 关键词稳定为 "connect list" / "Refused to connect"。
+   */
+  function isConnectBlockedError(err) {
+    const text = String(err?.error || err?.message || err?.statusText || err || '');
+    return /connect list|Refused to connect/i.test(text);
+  }
+
+  // 节流：心跳循环每 4 秒重试一次，避免每次都弹
+  let connectBlockedNoticeShownAt = 0;
+  const CONNECT_BLOCKED_NOTICE_INTERVAL_MS = 60000;
+
+  /**
+   * 弹出一个 15 秒后自动消失的 toast，告知用户目标主机被 @connect 列表拦截，
+   * 并给出可操作的修复方式。60 秒内最多触发一次。
+   */
+  function showConnectBlockedNotice(targetHost) {
+    const now = Date.now();
+    if (now - connectBlockedNoticeShownAt < CONNECT_BLOCKED_NOTICE_INTERVAL_MS) return;
+    connectBlockedNoticeShownAt = now;
+
+    // 已存在同 id 的 toast 先移除，避免堆叠
+    const existing = document.getElementById('agent-bridge-connect-notice');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'agent-bridge-connect-notice';
+    Object.assign(toast.style, {
+      position: 'fixed',
+      top: '60px',
+      right: '80px',
+      zIndex: '1000000',
+      padding: '10px 26px 10px 14px',
+      borderRadius: '8px',
+      background: '#dc2626',
+      color: '#fff',
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      fontSize: '12px',
+      lineHeight: '1.55',
+      maxWidth: '340px',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+    });
+
+    const codeStyle = 'background:rgba(255,255,255,0.18);padding:1px 4px;border-radius:3px;';
+
+    const title = document.createElement('div');
+    title.textContent = 'Bridge 被 @connect 列表拦截';
+    title.style.fontWeight = '600';
+    title.style.marginBottom = '4px';
+
+    const body = document.createElement('div');
+    body.innerHTML =
+      `目标主机 <code style="${codeStyle}">${targetHost}</code> 不在 userscript 的 ` +
+      `<code style="${codeStyle}">@connect</code> 列表中，无法连接 Bridge。`;
+
+    const hint = document.createElement('div');
+    hint.style.marginTop = '6px';
+    hint.style.opacity = '0.92';
+    hint.innerHTML =
+      `改用 <code style="${codeStyle}">127.0.0.1</code> 或 ` +
+      `<code style="${codeStyle}">localhost</code>，或在脚本头加入 ` +
+      `<code style="${codeStyle}">// @connect ${targetHost}</code> / ` +
+      `<code style="${codeStyle}">// @connect *</code>。`;
+
+    const closeBtn = document.createElement('span');
+    closeBtn.textContent = '×';
+    Object.assign(closeBtn.style, {
+      position: 'absolute',
+      top: '4px',
+      right: '8px',
+      cursor: 'pointer',
+      fontSize: '16px',
+      lineHeight: '1',
+      opacity: '0.85',
+      userSelect: 'none',
+    });
+    closeBtn.onclick = () => toast.remove();
+
+    toast.appendChild(closeBtn);
+    toast.appendChild(title);
+    toast.appendChild(body);
+    toast.appendChild(hint);
+    document.body.appendChild(toast);
+
+    setTimeout(() => {
+      if (toast.isConnected) toast.remove();
+    }, 15000);
+  }
+
   // ---- Robust request with timeout on both GM_xmlhttpRequest and fetch ----
   function request(options) {
     return new Promise((resolve, reject) => {
@@ -257,6 +341,12 @@
           },
           onerror: (err) => {
             console.error(`[AgentBridge:${currentPlatform.name}] GM_xmlhttpRequest network error:`, err);
+            if (isConnectBlockedError(err)) {
+              try {
+                const host = new URL(options.url).host;
+                showConnectBlockedNotice(host);
+              } catch { /* URL 解析失败时静默 */ }
+            }
             reject(err);
           },
           ontimeout: () => {
