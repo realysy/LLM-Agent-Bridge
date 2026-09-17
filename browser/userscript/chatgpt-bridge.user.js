@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.5.11
+// @version      0.6.0
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -220,6 +220,137 @@
     return null;
   }
 
+  // ==========================================================================
+  // Block 去重：网页对话本身保存历史，客户端每轮重发的 system / context / tools
+  // 不必重复注入。服务端把 messages 拆成带 kind 的 blocks，浏览器端按内容哈希
+  // 决定是否跳过。
+  //
+  // 状态只存在于当前页面内存，网页刷新即重置（符合"刷新=重新开始"的直觉）。
+  // 会话重置（URL 变化 / assistant 消息归零）时也会清空。
+  // ==========================================================================
+
+  // 当前对话已发送过的 block 哈希集合
+  const sentHashes = new Set();
+
+  // 会话重置标志：用户切走或关闭当前网页对话后置为 true，由下一次
+  // buildPromptFromPayload 消费。为 true 时该请求里所有 kind='context'
+  // 的 block 直接跳过（并记入 sentHashes），因为用户重置网页对话的意图
+  // 就是清空上下文，不该把客户端侧的历史补回去。
+  let contextResetPending = false;
+
+  /**
+   * FNV-1a 32-bit 哈希，无外部依赖，同步执行。
+   * 用于比较 block 内容是否已在当前网页对话里发送过。
+   */
+  function fnv1aHash(text, seed) {
+    let hash = seed >>> 0;
+    for (let i = 0; i < text.length; i += 1) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return hash.toString(16).padStart(8, '0');
+  }
+
+  /**
+   * 对 block 内容计算 16 位十六进制哈希。用两个不同种子拼接，降低碰撞概率。
+   *
+   * 只哈希 content、不哈希 kind：同一段文字在不同轮次里可能从 `turn` 降级为
+   * `context`（历史消息），kind 变化不应该影响去重结果。如果拼上 kind，第一轮
+   * 发过的 `turn` 内容在第二轮变成 `context` 时哈希不同，会被重复发送。
+   */
+  function hashBlock(content) {
+    return fnv1aHash(content, 0x811c9dc5) + fnv1aHash(content, 0x9e3779b9);
+  }
+
+  /**
+   * 把单个 block 渲染成注入网页的文本片段。保留角色前缀，便于网页模型理解结构。
+   */
+  function renderBlock(kind, content) {
+    switch (kind) {
+      case 'system':  return `SYSTEM: ${content}`;
+      case 'tools':   return `TOOLS: ${content}`;
+      case 'context': return `CONTEXT: ${content}`;
+      case 'turn':    return `USER: ${content}`;
+      default:        return content;
+    }
+  }
+
+  // 会话状态监视器只启动一次
+  let sessionWatchStarted = false;
+  let lastConversationToken = undefined;
+
+  /**
+   * 从 URL 中提取会话标识：取路径中最后一段长度 >= 8 且字符集为
+   * [A-Za-z0-9_-] 的片段。命中则返回该片段，否则返回 null。
+   *
+   * 各大平台的实际形态：
+   *   DeepSeek : https://chat.deepseek.com/a/chat/s/{token}
+   *   ChatGPT  : https://chatgpt.com/c/{token}
+   *   Qwen     : https://chat.qwen.ai/c/{token}
+   *
+   * 首页 / 新对话页面（如 https://chat.deepseek.com/）没有这段，返回 null。
+   * 不是完美解析，但足以区分"具体的某个会话"和"还没有会话"。
+   */
+  function extractConversationToken(url) {
+    try {
+      const pathname = new URL(url).pathname;
+      const segments = pathname.split('/').filter(Boolean);
+      for (let i = segments.length - 1; i >= 0; i -= 1) {
+        if (/^[A-Za-z0-9_-]{8,}$/.test(segments[i])) return segments[i];
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 监视网页会话是否发生重置。
+   *
+   * 只跟踪 URL 里的"会话标识"变化，而不是 URL 的任何变化。原因是：
+   *
+   *   在平台上新建会话时，URL 会经历两段变化：
+   *     /(无 token) → /a/chat/s/{token}   ← 用户发了第一条消息后被分配 ID
+   *     /a/chat/s/{token} → /             ← 用户点了"新对话"
+   *
+   *   第一段变化不是会话重置（对话内容还在，只是被分配了 ID），第二段才是。
+   *   如果无脑按 URL 变化清空哈希集合，就会在用户发完第一条消息后立刻清空，
+   *   导致下一轮请求把 system / context 又重发一遍（Cherry Studio 多轮测试中
+   *   观察到的 log2 现象）。
+   *
+   * 清空条件：之前 URL 里有一个会话 token，且现在 token 变了或消失了。
+   * "从无 token 到有 token"（新会话的第一条消息）不清空。
+   *
+   * 用 2 秒轮询而非 MutationObserver：URL 变化在 SPA 里通过 history.pushState
+   * 完成，不触发任何 DOM 事件，轮询更简单可靠，代价可忽略。
+   */
+  function startSessionWatch() {
+    if (sessionWatchStarted) return;
+    sessionWatchStarted = true;
+    lastConversationToken = extractConversationToken(window.location.href);
+
+    setInterval(() => {
+      const token = extractConversationToken(window.location.href);
+      if (token === lastConversationToken) return;
+
+      const wasInConversation = lastConversationToken !== null;
+      const previousToken = lastConversationToken;
+      lastConversationToken = token;
+
+      // 只有"从某个会话切走"才视为重置；新会话的第一条消息不重置
+      if (!wasInConversation) return;
+
+      if (sentHashes.size > 0) {
+        console.log(
+          `[AgentBridge:${currentPlatform.name}] Conversation changed ` +
+          `(${previousToken} -> ${token}), clearing ${sentHashes.size} block hashes`
+        );
+      }
+      sentHashes.clear();
+      // 标记下一次请求：丢弃所有 context，只发 system / tools / turn
+      contextResetPending = true;
+    }, 2000);
+  }
 
   /**
    * 检测 GM_xmlhttpRequest 的错误是否来自 userscript @connect 列表拦截。
@@ -879,7 +1010,81 @@
     }
   }
 
-// 4. Inject prompt & extract result
+  /**
+   * 从 payload 构造最终注入网页输入框的文本。
+   *
+   * 优先使用 payload.blocks（服务端拆好的结构化 blocks）：
+   *   - system / tools / context 按内容哈希去重，命中则跳过
+   *   - turn 永远发送
+   * 去重后的 hash 会加入 sentHashes，下一次请求可直接跳过。
+   *
+   * 若 payload.blocks 不存在（如 ws-transport.mjs send 直发 raw packet），
+   * 则退回 payload.packet 路径，不做去重，行为与旧版一致。
+   */
+  function buildPromptFromPayload(payload) {
+    const blocks = Array.isArray(payload?.blocks) ? payload.blocks : null;
+
+    if (blocks && blocks.length > 0) {
+      const parts = [];
+      let skipped = 0;
+      let droppedByReset = 0;
+      const wasResetPending = contextResetPending;
+      for (const block of blocks) {
+        const kind = String(block?.kind || 'user');
+        const content = String(block?.content || '');
+        if (!content) continue;
+
+        const hash = hashBlock(content);
+
+        // 会话刚重置：客户端侧的历史 context 全部丢弃，并加入 sentHashes
+        // 避免后续请求再次带上。system / tools 仍然发送，因为新网页对话
+        // 里确实没有它们；turn 永远发送。
+        if (contextResetPending && kind === 'context') {
+          sentHashes.add(hash);
+          skipped += 1;
+          droppedByReset += 1;
+          continue;
+        }
+
+        // 只有 system / tools / context 参与去重；turn 永远发送
+        const dedupable = kind === 'system' || kind === 'tools' || kind === 'context';
+        if (dedupable && sentHashes.has(hash)) {
+          skipped += 1;
+          continue;
+        }
+
+        parts.push(renderBlock(kind, content));
+        sentHashes.add(hash);
+      }
+
+      // 标志用一次即清空
+      contextResetPending = false;
+
+      if (wasResetPending && droppedByReset > 0) {
+        console.log(
+          `[AgentBridge:${currentPlatform.name}] Session reset: dropped ${droppedByReset} context block(s)`
+        );
+      }
+      if (skipped > 0) {
+        console.log(
+          `[AgentBridge:${currentPlatform.name}] Deduplicated ${skipped}/${blocks.length} blocks`
+        );
+      }
+
+      if (parts.length === 0) {
+        throw new Error('All blocks were deduplicated; nothing left to send.');
+      }
+
+      return parts.join('\n\n');
+    }
+
+    // 兼容路径：raw packet
+    return typeof payload?.packet === 'string'
+      ? payload.packet
+      : (payload?.packet?.content?.instruction || JSON.stringify(payload.packet));
+  }
+
+  // 4. Inject prompt & extract result
   async function handleReasoningRequest(requestId, payload) {
     if (isExecuting) {
       await safeReport({
@@ -900,9 +1105,10 @@
         throw new Error(`Could not find ${currentPlatform.name} prompt input area.`);
       }
 
-      const promptText = typeof payload.packet === 'string'
-        ? payload.packet
-        : (payload.packet?.content?.instruction || JSON.stringify(payload.packet));
+      // 首次执行时启动会话状态监视器（幂等）
+      startSessionWatch();
+
+      const promptText = buildPromptFromPayload(payload);
 
       // ---- 发送前快照：assistant 消息数量 + 最后一条文本 ----
       const beforeSnapshot = captureAssistantSnapshot();
