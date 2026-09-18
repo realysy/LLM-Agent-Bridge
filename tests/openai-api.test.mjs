@@ -371,18 +371,43 @@ test.describe('OpenAI API 兼容性测试', () => {
   });
   
   test.describe('原有桥接接口兼容性', () => {
-    test('GET /handoff 应保持可用', async () => {
-      const response = await httpRequest('/handoff');
-      // 可能返回需要参数的错误，但接口应该存在
+    test('POST /handoff 端点存在', async () => {
+      // /handoff 在 server 里只接受 POST；用 GET 会落到 404。
+      // 缺 body 时可能返回 500 或 400，但都不应是 404。
+      const response = await httpRequest('/handoff', {
+        method: 'POST',
+        body: {},
+      });
       assert.ok(response.statusCode !== 404);
     });
-    
-    test('GET /poll 应保持可用', async () => {
-      const response = await httpRequest('/poll?task_id=test');
-      assert.ok(response.statusCode !== 404);
+
+    test('GET /poll 端点存在（不等待 long-poll 超时）', async () => {
+      // /poll 是 long-poll 端点：没有 queued task 时会挂起最多 25 秒。
+      // 这里最多等 1 秒，然后主动断开，避免拖慢整个测试套件。
+      // 使用独立的 platform=test-probe 避免污染 chatgpt 的 activeProviders 状态。
+      const http = await import('node:http');
+      const result = await new Promise((resolve) => {
+        let settled = false;
+        const finish = (r) => {
+          if (settled) return;
+          settled = true;
+          try { req.destroy(); } catch {}
+          resolve(r);
+        };
+        const req = http.request(`${BASE_URL}/poll?platform=test-probe`, { method: 'GET' }, (res) => {
+          finish({ statusCode: res.statusCode });
+          res.resume();
+        });
+        req.on('error', () => finish({ statusCode: 0 }));
+        // 超过 1 秒仍未收到响应 → 视为 long-poll 生效，端点存在
+        setTimeout(() => finish({ statusCode: 200, longPoll: true }), 1000);
+        req.end();
+      });
+      // 收到 404 → 端点不存在；收到 200 或挂起 → 端点存在
+      assert.notStrictEqual(result.statusCode, 404, '/poll endpoint should exist');
     });
-    
-    test('POST /result 应保持可用', async () => {
+
+    test('POST /result 端点存在', async () => {
       const response = await httpRequest('/result', {
         method: 'POST',
         body: { task_id: 'test', result: 'test' },
@@ -434,6 +459,134 @@ test.describe('OpenAI API 兼容性测试', () => {
         response.body.error || 
         response.statusCode !== 200
       );
+    });
+  });
+
+  test.describe('/stream 端点', () => {
+    test('无需 API key 认证', async () => {
+      const http = await import('node:http');
+      const response = await new Promise((resolve, reject) => {
+        const req = http.request(`${BASE_URL}/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // 故意不带 Authorization
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+        });
+        req.on('error', reject);
+        req.write(JSON.stringify({
+          request_id: 'nonexistent',
+          text: 'hello',
+          done: false,
+        }));
+        req.end();
+      });
+
+      // /stream 跳过 API key 校验，未知 request_id 返回 ignored: true
+      assert.strictEqual(response.statusCode, 200);
+      const parsed = JSON.parse(response.body);
+      assert.strictEqual(parsed.ok, true);
+      assert.strictEqual(parsed.ignored, true);
+    });
+
+    test('拒绝无效 JSON', async () => {
+      const http = await import('node:http');
+      const response = await new Promise((resolve, reject) => {
+        const req = http.request(`${BASE_URL}/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+        });
+        req.on('error', reject);
+        req.write('not-json');
+        req.end();
+      });
+
+      assert.strictEqual(response.statusCode, 400);
+      const parsed = JSON.parse(response.body);
+      assert.strictEqual(parsed.ok, false);
+    });
+
+    test('未知 request_id 静默接受', async () => {
+      const http = await import('node:http');
+      const response = await new Promise((resolve, reject) => {
+        const req = http.request(`${BASE_URL}/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+        });
+        req.on('error', reject);
+        req.write(JSON.stringify({
+          request_id: 'req_does_not_exist',
+          text: 'any',
+          done: true,
+        }));
+        req.end();
+      });
+
+      assert.strictEqual(response.statusCode, 200);
+      const parsed = JSON.parse(response.body);
+      assert.strictEqual(parsed.ok, true);
+      assert.strictEqual(parsed.ignored, true);
+    });
+
+    test('端点存在但不是 GET 时返回 404', async () => {
+      const http = await import('node:http');
+      const response = await new Promise((resolve, reject) => {
+        const req = http.request(`${BASE_URL}/stream`, { method: 'GET' }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => resolve({ statusCode: res.statusCode }));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      // /stream 只接受 POST；GET 落到末尾的 404
+      assert.strictEqual(response.statusCode, 404);
+    });
+  });
+
+  test.describe('流式完整生命周期', () => {
+    test('stream=true 时应先发 role 帧再以 [DONE] 结束', async () => {
+      const http = await import('node:http');
+      const body = await new Promise((resolve, reject) => {
+        const req = http.request(`${BASE_URL}/v1/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${API_KEY}`,
+          },
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => resolve({ statusCode: res.statusCode, body: data }));
+        });
+        req.on('error', reject);
+        req.write(JSON.stringify({
+          model: 'qwen-web',
+          messages: [{ role: 'user', content: 'hi' }],
+          stream: true,
+        }));
+        req.end();
+      });
+
+      assert.strictEqual(body.statusCode, 200);
+      const lines = body.body.split('\n').filter(l => l.startsWith('data: '));
+      assert.ok(lines.length >= 2, 'SSE should emit at least role chunk and [DONE]');
+      // 第一个 data 帧应是 role: assistant
+      const first = JSON.parse(lines[0].slice(6));
+      assert.strictEqual(first.choices[0].delta.role, 'assistant');
+      // 最后一帧应是 [DONE]
+      assert.strictEqual(lines[lines.length - 1].trim(), 'data: [DONE]');
     });
   });
 });

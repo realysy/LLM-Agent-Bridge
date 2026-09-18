@@ -152,6 +152,11 @@ async function runAllChecks() {
       '## 快速上手',
       'assets/codex-bridge-chatgpt-architecture.png',
     ]),
+    await readmeCheck('openai_api_doc', 'skills/universal-agent-bridge/references/openai-api.md', [
+      'POST `/stream`',
+      'request_id',
+      '累积文本',
+    ]),
   ];
 
   const receipt = {

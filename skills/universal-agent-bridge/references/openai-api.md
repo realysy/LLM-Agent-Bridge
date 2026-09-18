@@ -10,19 +10,22 @@ The Universal Agent Bridge now provides an **OpenAI-compatible API endpoint** th
 ┌─────────────────────┐     ┌──────────────────────────┐     ┌─────────────────────┐
 │  Any OpenAI Client  │────▶│  Local Node.js Server    │────▶│  Browser Userscript │
 │  (curl, SDK, etc.)  │     │  (openai-api.mjs)        │     │  (Tampermonkey)     │
-│                     │     │  Port: 8765              │     │                     │
-└─────────────────────┘     └──────────────────────────┘     └─────────────────────┘
-                                   │                                  │
-                                   │                                  ▼
-                                   │                          ┌─────────────────────┐
-                                   │                          │   Web AI Platform   │
-                                   │                          │   (Claude/DeepSeek/ │
-                                   │                          │    ChatGPT/etc.)    │
-                                   │                          └─────────────────────┘
-                                   │
-                            Legacy Endpoints
-                            (/handoff, /poll, etc.)
+│                     │◀────│  Port: 8765              │◀────│                     │
+└─────────────────────┘ SSE └──────────────────────────┘ POST└─────────────────────┘
+       │                            │         ▲                  │
+       │                            │         │ /stream (实时上报)│
+       │                            │         └──────────────────┘
+       │                            │                            ▼
+       │                     Legacy Endpoints             ┌─────────────────────┐
+       │                     (/handoff, /poll, etc.)      │   Web AI Platform   │
+       │                                                  │   (ChatGPT/DeepSeek/│
+       └──────────────────────────────────────────────────│    Claude/Qwen/…)   │
+                                                          └─────────────────────┘
 ```
+
+浏览器每 500ms 通过 `POST /stream` 推送当前累积的 Markdown 文本；
+服务端切出新增部分（delta）实时转发给 SSE 客户端，实现真正的流式响应。
+
 
 ## Quick Start
 
@@ -166,6 +169,36 @@ curl http://localhost:8765/status
 }
 ```
 
+### POST `/stream`
+
+**内部端点**：浏览器 userscript 使用，无需 API Key 认证（以 `request_id` 作为隐式凭证）。
+
+浏览器在网页流式生成过程中持续推送"当前的累积 Markdown 文本"；server 切出与已推内容的差值（delta）实时转发给 SSE 客户端。
+
+**Request body:**
+```json
+{
+  "request_id": "req_1789702897_abc123",
+  "text": "## 标题\n\n已生成的部分内容…",
+  "done": false
+}
+
+**字段说明**：
+- `request_id` — 对应 `/v1/chat/completions` 发起 handoff 时生成的 `req_*` ID
+- `text` — **累积文本**，不是增量。server 端只推 `text.slice(pushedLength)`
+- `done` — `true` 时表示最终帧，server 会补齐剩余内容并结束 SSE
+
+**Response:**
+```json
+{ "ok": true, "accepted": true }
+```
+
+**回退避免策略**：server 只在满足以下条件之一时接受本次上报：
+- `text` 以 `lastReportedText` 为前缀（正常追加）
+- `done === true`（最终帧强制接受，保证结果完整）
+
+否则本次上报被静默忽略，`accepted: false`，等下一次采样对齐。这是为了容忍浏览器 DOM 的瞬时抖动（React 双缓冲、Monaco 中间态等）。
+
 ## Model Mapping
 
 The server automatically maps OpenAI-style model names to browser platforms:
@@ -256,6 +289,7 @@ These endpoints work exactly as in the original `ws-transport.mjs` server.
 | Authentication | None | Bearer token (optional) |
 | Model Discovery | Manual | `/v1/models` endpoint |
 | Response Format | Custom JSON | OpenAI standard |
+| Streaming | No (single-shot) | Yes — SSE + /stream real-time delta |
 | Use Case | Direct agent handoff | Universal LLM client integration |
 
 ## Troubleshooting
