@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.6.0
+// @version      0.6.1
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -151,7 +151,14 @@
       send: 'button.send-button:not([disabled]):not(.disabled)',
       // 停止按钮：button.stop-button（带 aria-label="停止"）
       stop: 'button.stop-button',
-      assistant: '.tongyi-ui-markdown, div[class*="contentWrapper"], div[class*="markdown"]',
+      // 整条 assistant 消息的顶层容器。
+      // 不能用 '.qwen-markdown' / 'div[class*="markdown"]' 这类选择器：
+      // .qwen-markdown 内部有大量嵌套的子 div（.qwen-markdown-paragraph、
+      // .qwen-markdown-space、.qwen-markdown-code-body 等）也匹配 class*="markdown"，
+      // 而 querySelectorAll 返回文档顺序，取最后一个只能拿到最深层的某个子节点，
+      // 会把整个回答截断成最后几行。.qwen-chat-message-assistant 是最外层容器，
+      // 一次回答对应一个，内部多个 .response-message-content 片段都会包含进来。
+      assistant: '.qwen-chat-message-assistant',
       model: () => document.querySelector('div[class*="model-name"], span[class*="modelTag"]')?.textContent.trim() || 'Qwen 2.5 Max/Plus',
       isLogin: () => !document.querySelector('.login-btn') && !hasButtonWithText('登录'),
     },
@@ -1233,6 +1240,260 @@
     }
   }
 
+  // ==========================================================================
+  // DOM → Markdown：把网页渲染后的回答节点转回 Markdown 文本。
+  //
+  // 网页的 assistant 节点是 HTML（标题、段落、代码块、表格等），直接取
+  // innerText 会把"复制/下载"按钮的文案、代码块语言标签、Monaco 编辑器
+  // 的行号等 UI 文本混进结果。这里按标签递归转换成标准 Markdown。
+  //
+  // 平台差异：
+  //   DeepSeek : 代码块是 div.md-code-block > pre > span 逐行
+  //   Qwen     : 代码块是 pre.qwen-markdown-code，代码在 Monaco 的 .view-line
+  // 其它元素走通用转换规则。
+  // ==========================================================================
+
+  /**
+   * 判断某个元素是否应该跳过（不参与 Markdown 输出）。
+   * 覆盖复制/下载按钮、SVG 图标、滚动条、工具状态卡片、页脚操作区等。
+   */
+  function shouldSkipElement(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName;
+
+    // 通用装饰性标签
+    if (tag === 'SVG' || tag === 'BUTTON' || tag === 'SCRIPT' || tag === 'STYLE') return true;
+
+    const cls = el.classList;
+    if (!cls) return false;
+
+    // DeepSeek：复制/下载按钮及其容器、滚动条 gutter
+    if (cls.contains('ds-button')) return true;
+    if (cls.contains('efa13877')) return true;                    // 按钮行容器
+    if (cls.contains('ds-scroll-area__gutters')) return true;     // 表格滚动条
+    if (cls.contains('ds-scroll-area__gutters') || cls.contains('ds-scroll-area__horizontal-gutter')) return true;
+    if (cls.contains('ds-scroll-area__vertical-gutter')) return true;
+
+    // Qwen：代码块 header 里的操作按钮、工具状态卡片、页脚操作、表格下载按钮
+    if (cls.contains('qwen-markdown-code-header-actions')) return true;
+    if (cls.contains('qwen-chat-tool-status-card-wraper')) return true;
+    if (cls.contains('qwen-chat-tool-status-card')) return true;
+    if (cls.contains('message-hoc-container')) return true;
+    if (cls.contains('qwen-chat-package-comp-new-action-control-icons')) return true;
+    if (cls.contains('qwen-markdown-table-header')) return true;
+
+    return false;
+  }
+
+  /**
+   * 平台定制的代码块提取。命中则返回 Markdown 代码块字符串，否则返回 null。
+   *
+   * 必须在通用标签分派之前调用：Qwen 的代码块根节点本身就是 <pre>，
+   * 若走通用 `case 'pre'` 分支会把 header 上的复制/下载文案也一起抓进去。
+   */
+  function tryExtractCodeBlock(node) {
+    const id = currentPlatform.id;
+
+    if (id === 'deepseek') {
+      if (!node.classList?.contains('md-code-block')) return null;
+      const lang = node.querySelector('.d813de27')?.textContent?.trim() || '';
+      const pre = node.querySelector('pre');
+      if (!pre) return null;
+      // DeepSeek 的 <pre> 直接子级 <span> 就是每一行
+      const lines = Array.from(pre.children)
+        .filter((c) => c.tagName === 'SPAN')
+        .map((s) => s.textContent);
+      return `\n\`\`\`${lang}\n${lines.join('\n')}\n\`\`\`\n\n`;
+    }
+
+    if (id === 'qwen') {
+      if (!node.classList?.contains('qwen-markdown-code')) return null;
+      const header = node.querySelector('.qwen-markdown-code-header');
+      const lang = header?.firstElementChild?.textContent?.trim() || '';
+      // Monaco 编辑器的每一行在 .view-line 里，\u00a0 是缩进用的不间断空格
+      const lines = Array.from(node.querySelectorAll('.view-line')).map((l) =>
+        l.textContent.replace(/\u00a0/g, ' ')
+      );
+      return `\n\`\`\`${lang}\n${lines.join('\n')}\n\`\`\`\n\n`;
+    }
+
+    return null;
+  }
+
+  /**
+   * 提取节点内部所有子节点的"内联"Markdown（不加段落级换行）。
+   * 用于列表项、表格单元格、标题等不允许出现 \n\n 的位置。
+   */
+  function inlineToMd(node) {
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1) return '';
+    if (shouldSkipElement(node)) return '';
+
+    const tag = node.tagName.toLowerCase();
+    switch (tag) {
+      case 'br': return '\n';
+      case 'strong': case 'b': return `**${inlineToMdChildren(node)}**`;
+      case 'em': case 'i': return `*${inlineToMdChildren(node)}*`;
+      case 'code': return `\`${node.textContent}\``;
+      case 'a': {
+        const href = node.getAttribute('href') || '';
+        const text = inlineToMdChildren(node);
+        return href ? `[${text}](${href})` : text;
+      }
+      default: return inlineToMdChildren(node);
+    }
+  }
+
+  function inlineToMdChildren(node) {
+    return Array.from(node.childNodes).map(inlineToMd).join('');
+  }
+
+  /**
+   * 把一个表格转换成 Markdown 表格。
+   * 单元格内容里的 | 会被转义，换行会被折叠为空格。
+   */
+  function tableToMd(table) {
+    const headRows = Array.from(table.querySelectorAll('thead tr'));
+    const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+
+    const renderRow = (row) =>
+      Array.from(row.children).map((cell) =>
+        inlineToMdChildren(cell).trim().replace(/\|/g, '\\|').replace(/\n+/g, ' ')
+      );
+
+    const lines = [];
+    let headerCells;
+    let dataRows;
+
+    if (headRows.length > 0) {
+      headerCells = renderRow(headRows[0]);
+      dataRows = bodyRows;
+    } else if (bodyRows.length > 0) {
+      // 没有 thead 时把第一行当表头
+      headerCells = renderRow(bodyRows[0]);
+      dataRows = bodyRows.slice(1);
+    } else {
+      return '';
+    }
+
+    if (headerCells.length > 0) {
+      lines.push('| ' + headerCells.join(' | ') + ' |');
+      lines.push('| ' + headerCells.map(() => '---').join(' | ') + ' |');
+    }
+    for (const row of dataRows) {
+      lines.push('| ' + renderRow(row).join(' | ') + ' |');
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * 把列表项内容转换成"单段内联文本"，其中 <p> 直接取内联内容而不加换行。
+   * 嵌套的 ul/ol 会以 \n 换行接在后面。
+   */
+  function listItemContent(li) {
+    return Array.from(li.childNodes).map((child) => {
+      if (child.nodeType === 3) return child.textContent;
+      if (child.nodeType !== 1) return '';
+      const tag = child.tagName.toLowerCase();
+      if (tag === 'p') return inlineToMdChildren(child);
+      if (tag === 'ul' || tag === 'ol') return '\n' + listToMd(child, tag === 'ol');
+      if (shouldSkipElement(child)) return '';
+      return inlineToMd(child);
+    }).join('');
+  }
+
+  /**
+   * 把 ul/ol 转换成 Markdown 列表。多行内容用缩进对齐。
+   */
+  function listToMd(list, ordered) {
+    const items = Array.from(list.children).filter((c) => c.tagName === 'LI');
+    return items.map((li, i) => {
+      const prefix = ordered ? `${i + 1}. ` : '- ';
+      const inner = listItemContent(li).trim();
+      const indented = inner.replace(/\n/g, '\n' + ' '.repeat(prefix.length));
+      return prefix + indented;
+    }).join('\n');
+  }
+
+  /**
+   * 递归把节点转换成块级 Markdown。返回空字符串表示该节点不产生输出。
+   */
+  function blockToMd(node) {
+    if (node.nodeType === 3) return node.textContent;
+    if (node.nodeType !== 1) return '';
+    if (shouldSkipElement(node)) return '';
+
+    // 平台定制的代码块必须在通用标签分派之前判断
+    const codeBlock = tryExtractCodeBlock(node);
+    if (codeBlock !== null) return codeBlock;
+
+    // Qwen 表格外层包装：内部才是真正的 <table>
+    if (node.classList?.contains('qwen-markdown-table-wrapper')) {
+      const table = node.querySelector('table');
+      if (table) return `\n${tableToMd(table)}\n\n`;
+    }
+
+    // Qwen 的段落/间距用带类名的 div 表示
+    if (node.classList?.contains('qwen-markdown-space')) return '';
+    if (node.classList?.contains('qwen-markdown-paragraph')) {
+      return `\n${inlineToMdChildren(node).trim()}\n\n`;
+    }
+
+    const tag = node.tagName.toLowerCase();
+    switch (tag) {
+      case 'h1': return `\n# ${inlineToMdChildren(node).trim()}\n\n`;
+      case 'h2': return `\n## ${inlineToMdChildren(node).trim()}\n\n`;
+      case 'h3': return `\n### ${inlineToMdChildren(node).trim()}\n\n`;
+      case 'h4': return `\n#### ${inlineToMdChildren(node).trim()}\n\n`;
+      case 'h5': return `\n##### ${inlineToMdChildren(node).trim()}\n\n`;
+      case 'h6': return `\n###### ${inlineToMdChildren(node).trim()}\n\n`;
+      case 'p': return `\n${inlineToMdChildren(node).trim()}\n\n`;
+      case 'hr': return `\n---\n\n`;
+      case 'br': return '\n';
+      case 'ul': return `\n${listToMd(node, false)}\n\n`;
+      case 'ol': return `\n${listToMd(node, true)}\n\n`;
+      case 'table': return `\n${tableToMd(node)}\n\n`;
+      case 'blockquote': {
+        const inner = blockToMdChildren(node).trim();
+        return `\n> ${inner.replace(/\n/g, '\n> ')}\n\n`;
+      }
+      case 'pre': {
+        // 通用 <pre> 兜底（未被平台定制规则命中的情况）
+        const code = node.textContent.replace(/\n$/, '');
+        return `\n\`\`\`\n${code}\n\`\`\`\n\n`;
+      }
+      case 'strong': case 'b': return `**${inlineToMdChildren(node)}**`;
+      case 'em': case 'i': return `*${inlineToMdChildren(node)}*`;
+      case 'code': return `\`${node.textContent}\``;
+      case 'a': {
+        const href = node.getAttribute('href') || '';
+        const text = inlineToMdChildren(node);
+        return href ? `[${text}](${href})` : text;
+      }
+      default:
+        return blockToMdChildren(node);
+    }
+  }
+
+  function blockToMdChildren(node) {
+    return Array.from(node.childNodes).map(blockToMd).join('');
+  }
+
+  /**
+   * 入口：把 assistant 节点的 DOM 子树转换成干净的 Markdown。
+   * 最后做几轮清理：合并多余空行、去掉行尾空白、去掉首尾空行。
+   */
+  function domToMarkdown(root) {
+    if (!root) return '';
+    const raw = blockToMdChildren(root);
+    return raw
+      .replace(/[ \t]+\n/g, '\n')     // 行尾空白
+      .replace(/\n{3,}/g, '\n\n')     // 三段以上空行压成两段
+      .replace(/^\n+/, '')            // 去首部空行
+      .replace(/\n+$/, '')            // 去尾部空行
+      .trim();
+  }
+
   // 抓取当前 assistant 消息快照
   function captureAssistantSnapshot() {
     let nodes = [];
@@ -1269,7 +1530,12 @@
     return false;
   }
 
-  // 取当前最新 assistant 消息文本
+  /**
+   * 取当前最新 assistant 消息的 Markdown 文本。
+   *
+   * 优先走 domToMarkdown 做结构化转换（正确保留代码块、表格、列表），
+   * 转换失败时回落到 innerText，保证功能不中断。
+   */
   function getLatestAssistantText() {
     let nodes = [];
     try {
@@ -1277,8 +1543,15 @@
     } catch (e) {
       return '';
     }
+    if (nodes.length === 0) return '';
     const last = nodes[nodes.length - 1];
-    if (!last) return '';
+
+    try {
+      const md = domToMarkdown(last);
+      if (md) return md;
+    } catch (e) {
+      console.warn(`[AgentBridge:${currentPlatform.name}] domToMarkdown failed, fallback to innerText:`, e);
+    }
     return (last.innerText || last.textContent || '').trim();
   }
 
