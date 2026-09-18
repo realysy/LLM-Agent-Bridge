@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.6.1
+// @version      0.6.2
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -107,6 +107,8 @@
       assistant: '.ds-markdown, .ds-message-assistant, div[class*="ds-message"]:not([class*="user"])',
       model: () => document.querySelector('.ds-dropdown-value, div[class*="model-name"]')?.textContent.trim() || 'DeepSeek-V3/R1',
       isLogin: () => !document.querySelector('div[class*="login-btn"], a[href*="/login"]'),
+      // Markdown 内容根容器。
+      markdownRoot: '.ds-markdown',
     },
     gemini: {
       id: 'gemini',
@@ -161,6 +163,8 @@
       assistant: '.qwen-chat-message-assistant',
       model: () => document.querySelector('div[class*="model-name"], span[class*="modelTag"]')?.textContent.trim() || 'Qwen 2.5 Max/Plus',
       isLogin: () => !document.querySelector('.login-btn') && !hasButtonWithText('登录'),
+      // Markdown 内容根容器：其直接子元素是流式推送的"顶层块"。
+      markdownRoot: '.qwen-markdown',
     },
     doubao: {
       id: 'doubao',
@@ -1091,6 +1095,101 @@
       : (payload?.packet?.content?.instruction || JSON.stringify(payload.packet));
   }
 
+  /**
+   * 去掉孤立的 UTF-16 surrogate 码元（高代理后没有低代理、或低代理前
+   * 没有高代理）。正常的字符（包括中文、emoji）不会受影响。
+   *
+   * 这是防御性措施：如果采集或处理过程中意外产生了孤立 surrogate，
+   * 编码为 UTF-8 时会被替换成 U+FFFD（），进而在客户端渲染成乱码。
+   */
+  function sanitizeSurrogates(text) {
+    if (!text) return text;
+    return text
+      .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
+      .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
+  }
+
+  /**
+   * 流式上报器：在网页流式生成过程中，每 500ms 采集一次当前的 Markdown
+   * 并通过 /stream 端点推给 server，让 SSE 客户端能实时看到内容。
+   *
+   * 采集内容用 domToMarkdown，保证和最终 /result 的格式一致。
+   *
+   * 避免回退：浏览器只负责"上报当前文本"，前缀不匹配的去重由 server 处理。
+   * 本函数只要保证"文本有变化才上报"即可。
+   */
+  function startStreamReporter(requestId, beforeSnapshot) {
+    let lastReportedText = '';
+    let stopped = false;
+    let inflight = false;
+
+    const timer = setInterval(async () => {
+      if (stopped || inflight) return;
+
+      // 只在"本次回答已开始"后才上报，避免把上一条回答的文本推出去
+      let started = false;
+      try {
+        started = hasNewResponseStarted(beforeSnapshot);
+      } catch { /* 选择器异常视为未开始 */ }
+      if (!started) return;
+
+      let text = '';
+      try {
+        text = getLatestAssistantText({ isFinal: false });
+      } catch { /* 采集失败时跳过本轮 */ }
+      text = sanitizeSurrogates(text);
+      if (!text || text === lastReportedText) return;
+
+      inflight = true;
+      try {
+        await request({
+          url: `${BASE_HTTP}/stream`,
+          method: 'POST',
+          data: { request_id: requestId, text, done: false },
+          timeout: 3000,
+        });
+        // 仅在成功后更新：失败时保留旧值，下一次采样还会重试推送同样的内容
+        lastReportedText = text;
+      } catch (e) {
+        // 流式上报失败不阻断主流程，静默重试
+        console.warn(`[AgentBridge:${currentPlatform.name}] stream report failed:`, e);
+      } finally {
+        inflight = false;
+      }
+    }, 500);
+
+    return {
+      /**
+       * 收尾：停止轮询并发送 done=true 的最终帧。
+       * 若 finalText 为空，用当前页面文本兜底。
+       */
+      async stop(finalText) {
+        stopped = true;
+        clearInterval(timer);
+        let text = finalText;
+        if (!text) {
+          try {
+            // 回退路径也用 isFinal=true，保证末尾代码块/表格不被跳过
+            text = getLatestAssistantText({ isFinal: true }) || lastReportedText;
+          } catch {
+            text = lastReportedText;
+          }
+        }
+        text = sanitizeSurrogates(text);
+        try {
+          await request({
+            url: `${BASE_HTTP}/stream`,
+            method: 'POST',
+            data: { request_id: requestId, text, done: true },
+            timeout: 5000,
+          });
+        } catch (e) {
+          console.warn(`[AgentBridge:${currentPlatform.name}] stream final report failed:`, e);
+        }
+      },
+    };
+  }
+
   // 4. Inject prompt & extract result
   async function handleReasoningRequest(requestId, payload) {
     if (isExecuting) {
@@ -1117,9 +1216,15 @@
 
       const promptText = buildPromptFromPayload(payload);
 
+      // 清空上一轮遗留的块状态：本次回答的所有块都是新内容，不需要继承上一轮的稳定计时。
+      topLevelBlockState.clear();
+
       // ---- 发送前快照：assistant 消息数量 + 最后一条文本 ----
       const beforeSnapshot = captureAssistantSnapshot();
       console.log(`[AgentBridge:${currentPlatform.name}] Snapshot before send:`, beforeSnapshot);
+
+      // 启动流式上报（在网页开始生成后，每 500ms 通过 /stream 推一次累积文本）
+      const streamReporter = startStreamReporter(requestId, beforeSnapshot);
 
       // Universal Input injection
       inputEl.focus();
@@ -1198,7 +1303,18 @@
       const sentAt = Date.now();
 
       // Wait for completion
-      const resultMarkdown = await waitForCompletion({ beforeSnapshot, sentAt });
+      let resultMarkdown;
+      try {
+        resultMarkdown = await waitForCompletion({ beforeSnapshot, sentAt });
+      } catch (err) {
+        // 超时/异常：用当前文本收尾，让流式客户端能拿到部分内容
+        await streamReporter.stop();
+        throw err;
+      }
+
+      // 流式收尾：推最终完整 Markdown，通知 server 结束 SSE
+      await streamReporter.stop(resultMarkdown);
+
       const state = getPageState();
 
       updateBadge('busy', 'Reporting...', 'Sending result to agent');
@@ -1207,7 +1323,7 @@
         type: 'REASONING_RESULT',
         request_id: requestId,
         payload: {
-          content: resultMarkdown,
+          content: sanitizeSurrogates(resultMarkdown),
           platform: currentPlatform.id,
           platform_name: currentPlatform.name,
           model: state.currentModel,
@@ -1270,8 +1386,9 @@
     // DeepSeek：复制/下载按钮及其容器、滚动条 gutter
     if (cls.contains('ds-button')) return true;
     if (cls.contains('efa13877')) return true;                    // 按钮行容器
-    if (cls.contains('ds-scroll-area__gutters')) return true;     // 表格滚动条
-    if (cls.contains('ds-scroll-area__gutters') || cls.contains('ds-scroll-area__horizontal-gutter')) return true;
+    // DeepSeek 表格的滚动条 gutter
+    if (cls.contains('ds-scroll-area__gutters')) return true;
+    if (cls.contains('ds-scroll-area__horizontal-gutter')) return true;
     if (cls.contains('ds-scroll-area__vertical-gutter')) return true;
 
     // Qwen：代码块 header 里的操作按钮、工具状态卡片、页脚操作、表格下载按钮
@@ -1282,38 +1399,180 @@
     if (cls.contains('qwen-chat-package-comp-new-action-control-icons')) return true;
     if (cls.contains('qwen-markdown-table-header')) return true;
 
+    // Qwen "多选一回复"界面：resolveMarkdownRoot 通常已深入到第一张卡片，
+    // 但作为防御，把提示文案、卡片头、卡片底按钮行一并跳过。
+    if (cls.contains('smrm-tip')) return true;
+    if (cls.contains('smrm-card__header')) return true;
+    if (cls.contains('smrm-card__footer')) return true;
+
     return false;
   }
 
   /**
-   * 平台定制的代码块提取。命中则返回 Markdown 代码块字符串，否则返回 null。
-   *
-   * 必须在通用标签分派之前调用：Qwen 的代码块根节点本身就是 <pre>，
-   * 若走通用 `case 'pre'` 分支会把 header 上的复制/下载文案也一起抓进去。
+   * 判断元素是否是各平台表示"空行间隔"的占位元素（例如 Qwen 的
+   * `.qwen-markdown-space`）。这些元素在判断"末尾块级元素"时应当被忽略，
+   * 因为它们只是渲染上的间距，不代表新内容开始。
    */
-  function tryExtractCodeBlock(node) {
-    const id = currentPlatform.id;
+  // 各平台表示"纯间距占位"的类名。新增平台时在此处补充。
+  const PLATFORM_SPACE_CLASSES = ['qwen-markdown-space'];
+  function isPlatformSpace(el) {
+    if (!el || !el.classList) return false;
+    for (const cls of el.classList) {
+      if (PLATFORM_SPACE_CLASSES.includes(cls)) return true;
+    }
+    return false;
+  }
 
-    if (id === 'deepseek') {
-      if (!node.classList?.contains('md-code-block')) return null;
-      const lang = node.querySelector('.d813de27')?.textContent?.trim() || '';
-      const pre = node.querySelector('pre');
-      if (!pre) return null;
-      // DeepSeek 的 <pre> 直接子级 <span> 就是每一行
-      const lines = Array.from(pre.children)
-        .filter((c) => c.tagName === 'SPAN')
-        .map((s) => s.textContent);
+  // ==========================================================================
+  // 流式"块级稳定"检测。
+  //
+  // 用户要求：粗粒度、正确优先。因此不再用"位置/行数增长"这类针对特定
+  // 元素类型的启发式判断，而是对 markdownRoot 的每个顶层子元素统一用
+  // "内容指纹稳定一段时间"作为渲染完成的标志。
+  //
+  // 稳定性阈值取 600ms：与采样间隔（500ms）的关系：阈值应该略大于一个采样周期，保证"两次
+  // 连续采样看到完全相同的转换结果"才推送，同时不要太大以避免串行延迟
+  // 累加。600ms 覆盖一次完整采样周期加抖动余量。
+  //
+  // 为什么不需要更长：
+  //   - H1/H2 等 tag 变化的中间态由 key 里的 tagName 覆盖，一旦 tag 变
+  //     化会立即重置计时；
+  //   - 代码块的中间态由 tryExtractCodeBlock 的 viewport height 判据覆盖，
+  //     未渲染完的代码块直接返回空字符串，不会触发 hash 变化；
+  //   - 表格逐行 append 会立即改变 hash；
+  // 因此真正的"未稳定"状态会在 500ms 内体现为 hash 变化，600ms 足以
+  // 判定"内容已稳定"。
+  //
+  // 之前设 2500ms 是因为中间态可以被误判为稳定。现在结构性判据已经解
+  // 决了那些误判，长窗口只会让串行推送的总延迟线性累加：20 个块的回答
+  // 用 2500ms 会累计 50 秒延迟，用 600ms 则降到 12 秒。
+  const BLOCK_STABLE_MS = 600;
+
+  // 每个顶层块的内容指纹与最后变化时间
+  const topLevelBlockState = new Map();
+
+  /**
+   * 按顺序转换 markdownRoot 的所有顶层子元素。
+   *
+   * 每个块先通过 blockToMd 转成 Markdown，然后**用转换结果本身**做稳定
+   * 判定。这是关键：指纹的来源必须和最终推送给客户端的内容一致，否则会
+   * 出现"指纹说稳定但输出还在变"的错位。
+   *
+   * 之前用 node.innerText 做指纹会包含 Monaco 编辑器的行号等 UI 文本，
+   * 而实际输出用的是 .view-line，两者更新节奏不同步。现在统一用转换
+   * 结果，任何真实内容变化都会立即改变哈希并重置稳定计时。
+   *
+   * 流式采样（isFinal !== true）时：遇到第一个未稳定的块就停止。保证每
+   * 次推送的内容都是"前几个已稳定块"的拼接，后续采样一定是本次内容的
+   * 前缀，server 端前缀检测不会拒绝。
+   *
+   * 最终帧（isFinal === true）时：不过滤，全部输出。
+   */
+  function renderTopLevelBlocks(root, options = {}) {
+    if (!root) return '';
+    const parts = [];
+    for (const child of root.childNodes) {
+      if (child.nodeType !== 1) continue;
+      if (shouldSkipElement(child)) continue;
+      if (isPlatformSpace(child)) continue;
+
+      // 先转换：转换结果既用于稳定判定，也用于最终输出
+      let converted;
+      try {
+        converted = blockToMd(child, options);
+      } catch (e) {
+        console.warn(`[AgentBridge:${currentPlatform.name}] blockToMd failed:`, e);
+        converted = '';
+      }
+
+      if (!options.isFinal) {
+        const hash = fnv1aHash(converted, 0x811c9dc5) + fnv1aHash(converted, 0x9e3779b9);
+        // 用 "tagName:hash" 作为 key：
+        //   - tag 变化（<p>→<h1>）：视为新块，计时重置
+        //   - 内容变化（同一 tag 下文本变）：hash 变化，视为新块
+        //   - tag 与内容都不变：state 延续，累积稳定时间
+        const key = `${child.tagName}:${hash}`;
+        const now = Date.now();
+        const prev = topLevelBlockState.get(key);
+        if (!prev) {
+          topLevelBlockState.set(key, { at: now });
+          break;
+        }
+        if (now - prev.at < BLOCK_STABLE_MS) {
+          break;
+        }
+      }
+
+      parts.push(converted);
+    }
+    return parts.join('');
+  }
+
+  /**
+   * 平台定制的代码块提取。
+   *   - 返回非空字符串：转换好的 Markdown 代码块
+   *   - 返回空字符串：这是代码块但还没渲染完成，本轮跳过
+   *   - 返回 null：不是代码块，走通用标签分派
+   *
+   * 判定完全基于节点自身的 class，不再依赖 currentPlatform.id。
+   * 之前用 `if (id === 'qwen')` 判断时，一旦平台识别失误就会落到最后的
+   * `return null`，让 blockToMd 继续走通用 `case 'pre'` 分支，把 Monaco
+   * 的行号 gutter（1 2 3 ...）当成代码内容输出。
+   *
+   * Qwen 的代码块根节点是 <pre>，Monaco 未渲染完时 .view-line 为空。
+   * 这种情况下必须返回空字符串跳过（不能 fallback 到 textContent，那会
+   * 包含行号）。空字符串 !== null，所以 blockToMd 不会继续往下走。
+   */
+  function tryExtractCodeBlock(node, options = {}) {
+    // Qwen 代码块。
+    // 主判据是 class 名，兜底判据是"<pre> 内含 Monaco 结构"。
+    // 兜底是必要的：流式渲染的某些阶段 className 可能与我们预期的不同，
+    // 一旦主判据失败，blockToMd 会回退到 case 'pre' 读 textContent，
+    // 把 Monaco 的行号 gutter 当成代码内容输出（表现为客户端出现 1 2 3）。
+    const isQwenCode = node.tagName === 'PRE' && (
+      node.classList?.contains('qwen-markdown-code') ||
+      !!node.querySelector('.view-line')
+    );
+    if (isQwenCode) {
+      // Monaco 完成渲染的结构性信号：.qwen-markdown-code-editor-viewport
+      // 上出现一个大于 0 的显式 height。
+      //
+      // 不能用"body 上有语言 class"作为信号——Qwen 里存在**无语言**的
+      // 代码块（例如项目结构块），它们的 .qwen-markdown-code-body 只有
+      // 一个 class（qwen-markdown-code-body 本身），会误伤。
+      //
+      // 也不能只判断 viewLines.length > 0——Monaco 分多次挂载 .view-line，
+      // 中间存在"部分行已挂载但布局尚未最终确定"的状态。
+      //
+      // viewport 的 height 是 Monaco 完成初始化、拿到最终内容高度后才
+      // 由 JS 显式写入的。在渲染完之前它是 0 或缺失。
+      const viewport = node.querySelector('.qwen-markdown-code-editor-viewport');
+      if (!viewport) {
+        return '';
+      }
+      const viewportHeight = parseInt(viewport.style.height, 10);
+      if (!Number.isFinite(viewportHeight) || viewportHeight <= 0) {
+        return '';
+      }
+
+      const header = node.querySelector('.qwen-markdown-code-header');
+      const lang = header?.firstElementChild?.textContent?.trim() || '';
+      const viewLines = Array.from(node.querySelectorAll('.view-line'));
+      if (viewLines.length === 0) {
+        return '';
+      }
+      const lines = viewLines.map((l) => l.textContent.replace(/\u00a0/g, ' '));
       return `\n\`\`\`${lang}\n${lines.join('\n')}\n\`\`\`\n\n`;
     }
 
-    if (id === 'qwen') {
-      if (!node.classList?.contains('qwen-markdown-code')) return null;
-      const header = node.querySelector('.qwen-markdown-code-header');
-      const lang = header?.firstElementChild?.textContent?.trim() || '';
-      // Monaco 编辑器的每一行在 .view-line 里，\u00a0 是缩进用的不间断空格
-      const lines = Array.from(node.querySelectorAll('.view-line')).map((l) =>
-        l.textContent.replace(/\u00a0/g, ' ')
-      );
+    // DeepSeek 代码块
+    if (node.classList?.contains('md-code-block')) {
+      const lang = node.querySelector('.d813de27')?.textContent?.trim() || '';
+      const pre = node.querySelector('pre');
+      if (!pre) return null;
+      const lines = Array.from(pre.children)
+        .filter((c) => c.tagName === 'SPAN')
+        .map((s) => s.textContent);
       return `\n\`\`\`${lang}\n${lines.join('\n')}\n\`\`\`\n\n`;
     }
 
@@ -1332,8 +1591,14 @@
     const tag = node.tagName.toLowerCase();
     switch (tag) {
       case 'br': return '\n';
-      case 'strong': case 'b': return `**${inlineToMdChildren(node)}**`;
-      case 'em': case 'i': return `*${inlineToMdChildren(node)}*`;
+      case 'strong': case 'b': {
+        const inner = inlineToMdChildren(node);
+        return inner ? `**${inner}**` : '';
+      }
+      case 'em': case 'i': {
+        const inner = inlineToMdChildren(node);
+        return inner ? `*${inner}*` : '';
+      }
       case 'code': return `\`${node.textContent}\``;
       case 'a': {
         const href = node.getAttribute('href') || '';
@@ -1387,30 +1652,61 @@
   }
 
   /**
-   * 把列表项内容转换成"单段内联文本"，其中 <p> 直接取内联内容而不加换行。
-   * 嵌套的 ul/ol 会以 \n 换行接在后面。
+   * 把列表项内容转换成 Markdown。
+   *
+   * 列表项内部可能既有内联内容（`<p>`、`<span>`、`<a>`、`<code>`…）又有
+   * 块级内容（代码块、表格、嵌套列表）。早期实现把所有非 p/ul/ol 的子
+   * 元素都交给 inlineToMd，导致代码块的语言标签和代码内容被拍成一行
+   * （例如 `[rustup](...)bashcurl --proto ...`）。现在区分对待：
+   *
+   *   - 纯文本节点：直接拼接
+   *   - <p>：内联内容（不加 \n\n，保持和列表项的紧凑格式）
+   *   - <ul> / <ol>：换行 + 递归列表
+   *   - 内联标签（span/strong/em/code/a/br）：inlineToMd
+   *   - 其它（div/pre/table…）：blockToMd，前后补空行
    */
-  function listItemContent(li) {
-    return Array.from(li.childNodes).map((child) => {
-      if (child.nodeType === 3) return child.textContent;
-      if (child.nodeType !== 1) return '';
+  function listItemContent(li, options = {}) {
+    const INLINE_TAGS = new Set(['span', 'strong', 'b', 'em', 'i', 'code', 'a', 'br']);
+    const parts = [];
+    for (const child of li.childNodes) {
+      if (child.nodeType === 3) {
+        parts.push(child.textContent);
+        continue;
+      }
+      if (child.nodeType !== 1) continue;
+      if (shouldSkipElement(child)) continue;
       const tag = child.tagName.toLowerCase();
-      if (tag === 'p') return inlineToMdChildren(child);
-      if (tag === 'ul' || tag === 'ol') return '\n' + listToMd(child, tag === 'ol');
-      if (shouldSkipElement(child)) return '';
-      return inlineToMd(child);
-    }).join('');
+      if (tag === 'p') {
+        parts.push(inlineToMdChildren(child));
+      } else if (tag === 'ul' || tag === 'ol') {
+        parts.push('\n' + listToMd(child, tag === 'ol', options));
+      } else if (INLINE_TAGS.has(tag)) {
+        parts.push(inlineToMd(child));
+      } else {
+        const blockMd = blockToMd(child, options).trim();
+        if (blockMd) parts.push('\n\n' + blockMd);
+      }
+    }
+    return parts.join('');
   }
 
   /**
    * 把 ul/ol 转换成 Markdown 列表。多行内容用缩进对齐。
+   *
+   * 空行不缩进：CommonMark 里"空行"必须是完全空白的行，如果在空行里
+   * 塞进缩进空格，某些解析器会把它视为"带空白的行"，从而中断列表项
+   * 内部的代码块识别。所以这里对空行保留为 ''，只缩进有内容的行。
    */
-  function listToMd(list, ordered) {
+  function listToMd(list, ordered, options = {}) {
     const items = Array.from(list.children).filter((c) => c.tagName === 'LI');
     return items.map((li, i) => {
       const prefix = ordered ? `${i + 1}. ` : '- ';
-      const inner = listItemContent(li).trim();
-      const indented = inner.replace(/\n/g, '\n' + ' '.repeat(prefix.length));
+      const indent = ' '.repeat(prefix.length);
+      const inner = listItemContent(li, options).trim();
+      const indented = inner
+        .split('\n')
+        .map((line, idx) => (idx === 0 ? line : (line ? indent + line : '')))
+        .join('\n');
       return prefix + indented;
     }).join('\n');
   }
@@ -1418,13 +1714,13 @@
   /**
    * 递归把节点转换成块级 Markdown。返回空字符串表示该节点不产生输出。
    */
-  function blockToMd(node) {
+  function blockToMd(node, options = {}) {
     if (node.nodeType === 3) return node.textContent;
     if (node.nodeType !== 1) return '';
     if (shouldSkipElement(node)) return '';
 
     // 平台定制的代码块必须在通用标签分派之前判断
-    const codeBlock = tryExtractCodeBlock(node);
+    const codeBlock = tryExtractCodeBlock(node, options);
     if (codeBlock !== null) return codeBlock;
 
     // Qwen 表格外层包装：内部才是真正的 <table>
@@ -1450,20 +1746,33 @@
       case 'p': return `\n${inlineToMdChildren(node).trim()}\n\n`;
       case 'hr': return `\n---\n\n`;
       case 'br': return '\n';
-      case 'ul': return `\n${listToMd(node, false)}\n\n`;
-      case 'ol': return `\n${listToMd(node, true)}\n\n`;
+      case 'ul': return `\n${listToMd(node, false, options)}\n\n`;
+      case 'ol': return `\n${listToMd(node, true, options)}\n\n`;
       case 'table': return `\n${tableToMd(node)}\n\n`;
       case 'blockquote': {
-        const inner = blockToMdChildren(node).trim();
+        const inner = blockToMdChildren(node, options).trim();
         return `\n> ${inner.replace(/\n/g, '\n> ')}\n\n`;
       }
       case 'pre': {
-        // 通用 <pre> 兜底（未被平台定制规则命中的情况）
+        // 若 <pre> 内含 Monaco 结构（.view-line 或 .monaco-editor），
+        // 它是一个我们没能正确识别的代码块。绝不能从 textContent 读
+        // 内容——那会包含 Monaco 的行号 gutter、语言标签、按钮文案。
+        // 返回空字符串让这个块暂时"消失"，等 tryExtractCodeBlock 命中
+        // 或 Monaco 渲染完成后再输出。
+        if (node.querySelector('.view-line, .monaco-editor')) {
+          return '';
+        }
         const code = node.textContent.replace(/\n$/, '');
         return `\n\`\`\`\n${code}\n\`\`\`\n\n`;
       }
-      case 'strong': case 'b': return `**${inlineToMdChildren(node)}**`;
-      case 'em': case 'i': return `*${inlineToMdChildren(node)}*`;
+      case 'strong': case 'b': {
+        const inner = inlineToMdChildren(node);
+        return inner ? `**${inner}**` : '';
+      }
+      case 'em': case 'i': {
+        const inner = inlineToMdChildren(node);
+        return inner ? `*${inner}*` : '';
+      }
       case 'code': return `\`${node.textContent}\``;
       case 'a': {
         const href = node.getAttribute('href') || '';
@@ -1471,21 +1780,62 @@
         return href ? `[${text}](${href})` : text;
       }
       default:
-        return blockToMdChildren(node);
+        return blockToMdChildren(node, options);
     }
   }
 
-  function blockToMdChildren(node) {
-    return Array.from(node.childNodes).map(blockToMd).join('');
+  function blockToMdChildren(node, options = {}) {
+    return Array.from(node.childNodes).map((c) => blockToMd(c, options)).join('');
+  }
+
+  /**
+   * 在转换前定位真正的"内容根"。
+   *
+   * Qwen 在"请选择一个回复"的场景下，会渲染一个 dual-message 容器，
+   * 里面并列两个 `.smrm-card`，各自包着一份完整的 `.chat-response-message`。
+   * 我们对这种结构只能返回一份答案，约定取第一个回复。
+   *
+   * 其它平台/场景直接返回原节点。
+   */
+  function resolveMarkdownRoot(node) {
+    if (!node) return node;
+    // Qwen 多选一回答：进入第一张卡片的 .chat-response-message 子树
+    if (node.classList?.contains('qwen-chat-message-dual-message')) {
+      const firstContent = node.querySelector('.smrm-card .chat-response-message');
+      if (firstContent) return firstContent;
+    }
+    return node;
   }
 
   /**
    * 入口：把 assistant 节点的 DOM 子树转换成干净的 Markdown。
-   * 最后做几轮清理：合并多余空行、去掉行尾空白、去掉首尾空行。
+   *
+   * 流式采样时只输出"已稳定的顶层块"，遇到第一个不稳定块即停止；最终帧
+   * 输出全部内容。最后做几轮清理：合并多余空行、去掉行尾空白、去首尾空行。
    */
-  function domToMarkdown(root) {
+  function domToMarkdown(root, options = {}) {
     if (!root) return '';
-    const raw = blockToMdChildren(root);
+    const effectiveRoot = resolveMarkdownRoot(root);
+
+    // 定位 markdown 内容根：
+    //   - 平台配置了 markdownRoot 且 effectiveRoot 恰好匹配它 → 用它本身
+    //   - 否则在 effectiveRoot 内部找 markdownRoot
+    //   - 都没找到则退回 effectiveRoot 本身
+    const rootSelector = currentPlatform.markdownRoot;
+    let blocksRoot = effectiveRoot;
+    if (rootSelector) {
+      try {
+        if (typeof effectiveRoot.matches === 'function' && effectiveRoot.matches(rootSelector)) {
+          blocksRoot = effectiveRoot;
+        } else {
+          const found = effectiveRoot.querySelector(rootSelector);
+          if (found) blocksRoot = found;
+        }
+      } catch { /* 无效选择器忽略 */ }
+    }
+
+    const raw = renderTopLevelBlocks(blocksRoot, options);
+
     return raw
       .replace(/[ \t]+\n/g, '\n')     // 行尾空白
       .replace(/\n{3,}/g, '\n\n')     // 三段以上空行压成两段
@@ -1536,7 +1886,7 @@
    * 优先走 domToMarkdown 做结构化转换（正确保留代码块、表格、列表），
    * 转换失败时回落到 innerText，保证功能不中断。
    */
-  function getLatestAssistantText() {
+  function getLatestAssistantText(options = {}) {
     let nodes = [];
     try {
       nodes = Array.from(document.querySelectorAll(currentPlatform.assistant));
@@ -1547,8 +1897,16 @@
     const last = nodes[nodes.length - 1];
 
     try {
-      const md = domToMarkdown(last);
-      if (md) return md;
+      // 无条件返回 domToMarkdown 的结果，即使它是空字符串。
+      //
+      // 空字符串是"本轮所有块都还没稳定"的合法结果，不是错误。
+      // 之前的 `if (md) return md;` 会把空字符串当作转换失败，fallback
+      // 到 innerText —— 而 innerText 包含 Monaco 行号、未处理的 markdown
+      // 标记等 UI 文本，与后续真实的 markdown 输出不是前缀关系，会让
+      // server 端前缀检测永久拒绝，客户端卡在 innerText 版本直到最终帧。
+      //
+      // 只有 domToMarkdown 抛异常时（真正的转换失败）才回退。
+      return domToMarkdown(last, options);
     } catch (e) {
       console.warn(`[AgentBridge:${currentPlatform.name}] domToMarkdown failed, fallback to innerText:`, e);
     }
@@ -1581,6 +1939,16 @@
       let hadVisibleStopButton = false;
       let responseStarted = false;
       let responseStartedAt = 0;
+
+      // 判定完成时，用 isFinal=true 重新采集一次，确保末尾代码块不被跳过
+      const collectFinal = () => {
+        try {
+          const t = getLatestAssistantText({ isFinal: true });
+          return t || lastText;
+        } catch {
+          return lastText;
+        }
+      };
 
       const checkInterval = setInterval(() => {
         const now = Date.now();
@@ -1624,7 +1992,7 @@
           if (currentText && now - lastChangeAt >= hardStableMs) {
             clearInterval(checkInterval);
             console.log(`[AgentBridge:${currentPlatform.name}] Completion detected (hard-stable ${hardStableMs}ms, stop btn still visible).`);
-            resolve(currentText);
+            resolve(collectFinal());
           }
           return;
         }
@@ -1644,7 +2012,7 @@
           if (streamStableCount >= requiredStableChecks) {
             clearInterval(checkInterval);
             console.log(`[AgentBridge:${currentPlatform.name}] Completion detected.`);
-            resolve(currentText);
+            resolve(collectFinal());
           }
         } else {
           streamStableCount = 0;

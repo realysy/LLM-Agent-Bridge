@@ -73,7 +73,12 @@ export class OpenAIApiServer {
     this.activeProviders = new Map();
     this.httpPollWaiters = new Map();
     this.queuedTasks = [];
-    
+
+    // 流式输出注册表：handoff request_id → 流式状态。
+    // 当 /v1/chat/completions 使用 stream=true 时，会在这里注册一个 entry，
+    // 浏览器通过 /stream 端点持续推送累积文本，server 从中切出 delta 推给客户端。
+    this.streamingOutputs = new Map();
+
     // Request ID counter for OpenAI compatibility
     this.requestIdCounter = 0;
   }
@@ -145,8 +150,10 @@ export class OpenAIApiServer {
         const urlObj = new URL(req.url, `http://127.0.0.1:${this.port}`);
         const pathname = urlObj.pathname;
 
-        // Skip API key validation for status endpoint
-        if (pathname !== '/status' && !this.validateApiKey(req)) {
+        // Skip API key validation for status and stream endpoints.
+        // /stream 是浏览器脚本的内部通道：它不携带 API key，
+        // 以知道 request_id 作为隐式凭证。
+        if (pathname !== '/status' && pathname !== '/stream' && !this.validateApiKey(req)) {
           res.writeHead(401, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             error: {
@@ -209,6 +216,9 @@ export class OpenAIApiServer {
             const wantsStream = data.stream === true;
 
             // ==================== 流式（SSE）分支 ====================
+            // 真流式：浏览器在网页流式过程中通过 /stream 端点持续推送累积文本，
+            // server 切出 delta 实时转发。若浏览器未推 /stream（旧版脚本），
+            // 则在 /result 到达时一次性分片推送（兼容路径）。
             if (wantsStream) {
               res.writeHead(200, {
                 'Content-Type': 'text/event-stream; charset=utf-8',
@@ -225,34 +235,18 @@ export class OpenAIApiServer {
               const created = Math.floor(Date.now() / 1000);
               const modelName = data.model || 'chatgpt-web';
 
-              // ⭐⭐⭐ 关键修复：用 res.on('close') 而非 req.on('close') ⭐⭐⭐
               let aborted = false;
-              res.on('close', () => {
-                if (!res.writableEnded) {
-                  aborted = true;
-                  console.log(`[SSE-ABORT] client disconnected before response ended`);
-                }
-              });
-
               const writeChunk = (delta, finishReason = null) => {
-                if (aborted) {
-                  console.log(`[SSE-WRITE] skipped (aborted=true), finish_reason=${finishReason}`);
-                  return false;
-                }
+                if (aborted) return false;
                 const chunk = {
                   id: requestId,
                   object: 'chat.completion.chunk',
                   created,
                   model: modelName,
-                  choices: [{
-                    index: 0,
-                    delta,
-                    finish_reason: finishReason,
-                  }],
+                  choices: [{ index: 0, delta, finish_reason: finishReason }],
                 };
-                const line = `data: ${JSON.stringify(chunk)}\n\n`;
                 try {
-                  res.write(line);
+                  res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                   return true;
                 } catch (e) {
                   console.error(`[SSE-WRITE] failed:`, e);
@@ -262,10 +256,7 @@ export class OpenAIApiServer {
               };
 
               const writeDone = () => {
-                if (res.writableEnded) {
-                  console.log(`[SSE-DONE] already ended`);
-                  return;
-                }
+                if (res.writableEnded) return;
                 try {
                   res.write('data: [DONE]\n\n');
                   res.end();
@@ -274,49 +265,112 @@ export class OpenAIApiServer {
                 }
               };
 
-              try {
-                // 1. 角色起始帧
-                writeChunk({ role: 'assistant', content: '' });
+              // 角色起始帧
+              writeChunk({ role: 'assistant', content: '' });
 
-                // 2. 阻塞等 bridge 返回完整内容（这是异步的，中间可能几分钟）
-                const result = await this.handleChatCompletion(data);
-                const content = result.choices?.[0]?.message?.content || '';
+              // 生成 handoff 请求 ID，并把流式状态注册进 streamingOutputs，
+              // 这样浏览器发来的 /stream 帧就能找到对应的 SSE response。
+              const handoffRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-                // 3. 分片推送
-                const CHUNK_SIZE = 20;
-                if (content.length > 0) {
-                  for (let i = 0; i < content.length; i += CHUNK_SIZE) {
-                    if (aborted) break;
-                    writeChunk({ content: content.slice(i, i + CHUNK_SIZE) });
-                  }
+              const streamState = {
+                res,
+                openaiRequestId: requestId,
+                created,
+                modelName,
+                pushedLength: 0,
+                lastReportedText: '',
+                writeChunk,
+                writeDone,
+                aborted: () => aborted,
+                finished: false,
+                timer: null,
+                data,   // 保留原始请求体，用于 usage 计算
+              };
+              this.streamingOutputs.set(handoffRequestId, streamState);
+
+              res.on('close', () => {
+                if (!res.writableEnded) {
+                  aborted = true;
+                  console.log(`[SSE-ABORT] client disconnected before response ended`);
                 }
-
-                // 4. finish_reason: stop
-                writeChunk({}, 'stop');
-
-                // 5. usage（可选）
-                if (data.stream_options?.include_usage) {
-                  const usageChunk = {
-                    id: requestId,
-                    object: 'chat.completion.chunk',
-                    created,
-                    model: modelName,
-                    choices: [],
-                    usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-                  };
-                  if (!aborted) res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+                if (!streamState.finished) {
+                  streamState.finished = true;
+                  if (streamState.timer) clearTimeout(streamState.timer);
+                  this.streamingOutputs.delete(handoffRequestId);
                 }
+              });
 
-                // 6. 结束
-                writeDone();
-              } catch (err) {
-                console.error(`[SSE-ERROR]`, err.message);
+              // 超时保护：5 分钟无 final 帧则强制结束，防止客户端永久挂起
+              streamState.timer = setTimeout(() => {
+                if (streamState.finished) return;
+                streamState.finished = true;
+                this.streamingOutputs.delete(handoffRequestId);
+                console.error(`[SSE-TIMEOUT] requestId=${handoffRequestId}`);
                 if (!aborted) {
-                  writeChunk({ content: `\n[Error: ${err.message || 'Internal server error'}]` }, null);
+                  writeChunk({ content: '\n[Error: Stream timed out]' }, null);
                   writeChunk({}, 'stop');
                 }
                 writeDone();
-              }
+              }, 5 * 60 * 1000);
+
+              // 发起 handoff（不 await；真正的推送逻辑由 /stream 驱动）
+              this.handleChatCompletion(data, { requestId: handoffRequestId })
+                .then((result) => {
+                  if (streamState.finished) return;
+
+                  // 浏览器已在推 /stream：不做兼容路径，等 done 帧处理。
+                  // 只有当 pushedLength === 0（浏览器完全没推 /stream）时才走兼容路径。
+                  if (streamState.pushedLength > 0) {
+                    // 兜底：如果 10 秒内 done 帧仍未来到，用 result 强制收尾
+                    setTimeout(() => {
+                      if (streamState.finished) return;
+                      const content = result.choices?.[0]?.message?.content || '';
+                      const tail = content.slice(streamState.pushedLength);
+                      if (!aborted && tail) writeChunk({ content: tail });
+                      if (!aborted) writeChunk({}, 'stop');
+                      streamState.finished = true;
+                      if (streamState.timer) clearTimeout(streamState.timer);
+                      this.streamingOutputs.delete(handoffRequestId);
+                      writeDone();
+                    }, 10000);
+                    return;
+                  }
+
+                  const content = result.choices?.[0]?.message?.content || '';
+                  const tail = content.slice(streamState.pushedLength);
+                  if (!aborted && tail) {
+                    writeChunk({ content: tail });
+                  }
+                  if (!aborted) writeChunk({}, 'stop');
+                  if (!aborted && data.stream_options?.include_usage) {
+                    const usageChunk = {
+                      id: requestId,
+                      object: 'chat.completion.chunk',
+                      created,
+                      model: modelName,
+                      choices: [],
+                      usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                    };
+                    res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
+                  }
+                  streamState.finished = true;
+                  clearTimeout(streamState.timer);
+                  this.streamingOutputs.delete(handoffRequestId);
+                  writeDone();
+                })
+                .catch((err) => {
+                  if (streamState.finished) return;
+                  console.error(`[SSE-ERROR]`, err.message);
+                  if (!aborted) {
+                    writeChunk({ content: `\n[Error: ${err.message || 'Internal server error'}]` }, null);
+                    writeChunk({}, 'stop');
+                  }
+                  streamState.finished = true;
+                  clearTimeout(streamState.timer);
+                  this.streamingOutputs.delete(handoffRequestId);
+                  writeDone();
+                });
+
               return;
             }
 
@@ -416,6 +470,89 @@ export class OpenAIApiServer {
               res.writeHead(400);
               res.end();
             }
+          });
+          return;
+        }
+
+        // HTTP Streaming Update from Userscript
+        //
+        // 浏览器在网页流式过程中持续推送"当前的累积文本"。Server 从中切出
+        // 与"已推给客户端的文本"的差值，推给 SSE 客户端。
+        //
+        // 请求体：
+        //   { request_id: "req_...", text: "累积文本", done: false }
+        //
+        // 回退避免策略：
+        //   - 新文本以"上次上报文本"为前缀 → 推 delta（正常追加）
+        //   - 新文本不以它为前缀 → 静默忽略，等下一次上报对齐
+        //     （通常是 DOM 从"纯文本代码块"切换到 Monaco 编辑器时的瞬时抖动）
+        //   - done: true → 无论如何都推剩余部分，保证答案完整
+        if (pathname === '/stream' && req.method === 'POST') {
+          let body = '';
+          req.on('data', (chunk) => { body += chunk; });
+          req.on('end', () => {
+            let data;
+            try {
+              data = JSON.parse(body);
+            } catch {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: 'invalid json' }));
+              return;
+            }
+
+            const { request_id: requestId, text, done } = data;
+            const newText = String(text || '');
+            const isDone = done === true;
+
+            const state = this.streamingOutputs.get(requestId);
+            if (!state || state.finished) {
+              // 未知或已结束的 requestId：可能客户端已断开，静默接受
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, ignored: true }));
+              return;
+            }
+
+            const prevText = state.lastReportedText || '';
+            // 改为函数调用，每次判断时都取最新值
+            const isAborted = () => state.aborted();
+
+            let accept = false;
+            if (!prevText) {
+              accept = true;
+            } else if (newText.startsWith(prevText)) {
+              accept = true;
+            } else if (newText.length <= prevText.length) {
+              accept = false;
+            } else {
+              accept = isDone;
+            }
+
+            if (accept && !isAborted()) {
+              const delta = newText.slice(state.pushedLength);
+              if (delta) {
+                state.writeChunk({ content: delta });
+                state.pushedLength = newText.length;
+              }
+              state.lastReportedText = newText;
+            }
+
+            if (isDone) {
+              if (!isAborted() && !state.finished) {
+                const tail = newText.slice(state.pushedLength);
+                if (tail) {
+                  state.writeChunk({ content: tail });
+                  state.pushedLength = newText.length;
+                }
+                state.writeChunk({}, 'stop');
+              }
+              state.finished = true;
+              if (state.timer) clearTimeout(state.timer);
+              this.streamingOutputs.delete(requestId);
+              if (!isAborted()) state.writeDone();
+            }
+
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, accepted: accept }));
           });
           return;
         }
@@ -533,16 +670,18 @@ export class OpenAIApiServer {
       this.clients.clear();
       this.activeProviders.clear();
 
-      for (const list of this.httpPollWaiters.values()) {
-        for (const waiter of list) {
-          try {
-            clearTimeout(waiter.timer);
-            waiter.res.writeHead(200, { 'Content-Type': 'application/json' });
-            waiter.res.end(JSON.stringify({ task: null }));
-          } catch {}
-        }
+      for (const [requestId, state] of this.streamingOutputs.entries()) {
+        try {
+          state.finished = true;
+          if (state.timer) clearTimeout(state.timer);
+          if (!state.aborted()) {
+            state.writeChunk({ content: '\n[Error: Server shutting down]' }, null);
+            state.writeChunk({}, 'stop');
+            state.writeDone();
+          }
+        } catch {}
       }
-      this.httpPollWaiters.clear();
+      this.streamingOutputs.clear();
 
       if (this.server) {
         this.server.close(res);
@@ -556,7 +695,7 @@ export class OpenAIApiServer {
    * Handle OpenAI Chat Completions API
    * Converts OpenAI request format to bridge packet and routes to browser
    */
-  async handleChatCompletion(openAiRequest) {
+  async handleChatCompletion(openAiRequest, options = {}) {
     const {
       model = 'chatgpt-web',
       messages = [],
@@ -577,10 +716,13 @@ export class OpenAIApiServer {
     const blocks = this.buildBlocks(messages, tools);
 
     // Execute via bridge - pass prompt as plain string for browser to inject
-    const result = await this.executeHandoff(prompt, { 
+    const result = await this.executeHandoff(prompt, {
       platform: platformId,
       timeout: 280,
       blocks,
+      // 流式模式下由调用方指定 requestId，使 server 能提前注册 /stream 输出表；
+      // 非流式模式下为 undefined，executeHandoff 会自行生成。
+      requestId: options.requestId,
     });
 
     // Generate OpenAI-compatible response
@@ -831,7 +973,10 @@ export class OpenAIApiServer {
       throw new Error(`NEEDS_BROWSER_CONNECTION: No active browser tab connected for platform [${targetPlatform}]. Please open the platform in your browser with the bridge userscript active.`);
     }
 
-    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // 优先使用调用方指定的 requestId（流式模式下 server 已用它注册 /stream 输出表），
+    // 否则自行生成。
+    const requestId = options.requestId
+      || `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
     // 构建要发给浏览器的任务包
     const isStringPrompt = typeof packetContent === 'string';
