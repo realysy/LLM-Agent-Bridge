@@ -108,7 +108,11 @@
       model: () => document.querySelector('.ds-dropdown-value, div[class*="model-name"]')?.textContent.trim() || 'DeepSeek-V3/R1',
       isLogin: () => !document.querySelector('div[class*="login-btn"], a[href*="/login"]'),
       // Markdown 内容根容器。
-      markdownRoot: '.ds-markdown',
+      //
+      // 不能用 '.ds-markdown'：DeepSeek 的思考容器 .ds-think-content 里
+      // 也有 .ds-markdown，querySelector 会匹配到两个。正式回答的那个带
+      // .ds-assistant-message-main-content 类，用这个精确匹配。
+      markdownRoot: '.ds-assistant-message-main-content',
     },
     gemini: {
       id: 'gemini',
@@ -1399,6 +1403,16 @@
     if (cls.contains('qwen-chat-package-comp-new-action-control-icons')) return true;
     if (cls.contains('qwen-markdown-table-header')) return true;
 
+    // Qwen 思考模式：thinking 状态卡片（"正在思考…跳过"等）。
+    // 流式早期它出现在 .qwen-markdown 之外，可能被 blockToMd 抓成正式回答。
+    for (const cn of cls) {
+      if (cn.startsWith('qwen-chat-thinking-')) return true;
+    }
+
+    // DeepSeek 思考模式：思考内容容器。
+    // 里面也有 .ds-markdown，若某个路径绕过 markdownRoot 检查会抓到它。
+    if (cls.contains('ds-think-content')) return true;
+
     // Qwen "多选一回复"界面：resolveMarkdownRoot 通常已深入到第一张卡片，
     // 但作为防御，把提示文案、卡片头、卡片底按钮行一并跳过。
     if (cls.contains('smrm-tip')) return true;
@@ -1430,9 +1444,9 @@
   // 元素类型的启发式判断，而是对 markdownRoot 的每个顶层子元素统一用
   // "内容指纹稳定一段时间"作为渲染完成的标志。
   //
-  // 稳定性阈值取 600ms：与采样间隔（500ms）的关系：阈值应该略大于一个采样周期，保证"两次
+  // 稳定性阈值取 700ms：与采样间隔（500ms）的关系：阈值应该略大于一个采样周期，保证"两次
   // 连续采样看到完全相同的转换结果"才推送，同时不要太大以避免串行延迟
-  // 累加。600ms 覆盖一次完整采样周期加抖动余量。
+  // 累加。700ms 覆盖一次完整采样周期加抖动余量。
   //
   // 为什么不需要更长：
   //   - H1/H2 等 tag 变化的中间态由 key 里的 tagName 覆盖，一旦 tag 变
@@ -1440,13 +1454,13 @@
   //   - 代码块的中间态由 tryExtractCodeBlock 的 viewport height 判据覆盖，
   //     未渲染完的代码块直接返回空字符串，不会触发 hash 变化；
   //   - 表格逐行 append 会立即改变 hash；
-  // 因此真正的"未稳定"状态会在 500ms 内体现为 hash 变化，600ms 足以
+  // 因此真正的"未稳定"状态会在 500ms 内体现为 hash 变化，700ms 足以
   // 判定"内容已稳定"。
   //
   // 之前设 2500ms 是因为中间态可以被误判为稳定。现在结构性判据已经解
   // 决了那些误判，长窗口只会让串行推送的总延迟线性累加：20 个块的回答
-  // 用 2500ms 会累计 50 秒延迟，用 600ms 则降到 12 秒。
-  const BLOCK_STABLE_MS = 600;
+  // 用 2500ms 会累计 50 秒延迟，用 700ms 则降到 14 秒。
+  const BLOCK_STABLE_MS = 700;
 
   // 每个顶层块的内容指纹与最后变化时间
   const topLevelBlockState = new Map();
@@ -1818,20 +1832,29 @@
     const effectiveRoot = resolveMarkdownRoot(root);
 
     // 定位 markdown 内容根：
-    //   - 平台配置了 markdownRoot 且 effectiveRoot 恰好匹配它 → 用它本身
-    //   - 否则在 effectiveRoot 内部找 markdownRoot
-    //   - 都没找到则退回 effectiveRoot 本身
+    //   - 平台配置了 markdownRoot：
+    //       - effectiveRoot 恰好匹配它 → 用它本身
+    //       - 在 effectiveRoot 内部能找到 → 用找到的
+    //       - 都找不到 → 返回空字符串，等下一轮采样。**不 fallback**
+    //         到 effectiveRoot，否则会把思考内容（DeepSeek 的
+    //         .ds-think-content、Qwen 的 thinking 卡片）当作正式回答输出
+    //   - 平台未配置 markdownRoot → 退回 effectiveRoot 本身
     const rootSelector = currentPlatform.markdownRoot;
-    let blocksRoot = effectiveRoot;
+    let blocksRoot;
     if (rootSelector) {
       try {
         if (typeof effectiveRoot.matches === 'function' && effectiveRoot.matches(rootSelector)) {
           blocksRoot = effectiveRoot;
         } else {
-          const found = effectiveRoot.querySelector(rootSelector);
-          if (found) blocksRoot = found;
+          blocksRoot = effectiveRoot.querySelector(rootSelector);
         }
       } catch { /* 无效选择器忽略 */ }
+      if (!blocksRoot) {
+        // 正式回答还没开始渲染，本轮无内容可输出
+        return '';
+      }
+    } else {
+      blocksRoot = effectiveRoot;
     }
 
     const raw = renderTopLevelBlocks(blocksRoot, options);
