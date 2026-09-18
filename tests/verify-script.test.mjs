@@ -28,6 +28,7 @@ test('the portable verifier runs every deterministic package gate', () => {
       'architecture_asset_zh',
       'readme_en',
       'readme_zh',
+      'openai_api_doc',
     ],
   );
   assert.ok(receipt.checks.every((check) => check.status === 'passed'));
