@@ -38,8 +38,10 @@ export function openBrowser(platform = 'chatgpt') {
 }
 
 export class BridgeServer {
-  constructor(port = DEFAULT_PORT) {
+  constructor(port = DEFAULT_PORT, host = '127.0.0.1') {
     this.port = port;
+    // 默认只监听 loopback。开放到 0.0.0.0 需要显式传 host 参数。
+    this.host = host;
     this.clients = new Set();
     this.pendingRequests = new Map();
     this.server = null;
@@ -268,7 +270,7 @@ export class BridgeServer {
         });
       });
 
-      this.server.listen(this.port, '0.0.0.0', () => {
+      this.server.listen(this.port, this.host, () => {
         resolveStart(this);
       });
 
@@ -488,14 +490,18 @@ async function main() {
   if (!command || command === '--help' || command === '-h') {
     console.log(`
 Usage:
-  node ws-transport.mjs serve [--port 8765]
+  node ws-transport.mjs serve [--port 8765] [--host 127.0.0.1]
   node ws-transport.mjs status [--port 8765]
-  node ws-transport.mjs send <packet_file> [output_file] [--platform auto|chatgpt|claude|deepseek|gemini|kimi|grok|qwen|doubao|glm] [--port 8765] [--timeout 180]
+  node ws-transport.mjs send <packet_file> [output_file] [--platform auto|chatgpt|claude|deepseek|gemini|kimi|grok|qwen|doubao|glm] [--port 8765] [--host 127.0.0.1] [--timeout 180]
 
 Commands:
   serve   Start standalone Universal Bridge server
   status  Check connected browser platforms (ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, GLM)
   send    Send a Context Packet to an active Web reasoning platform
+
+Options:
+  --host  Interface to bind (default: 127.0.0.1, loopback only).
+          Use 0.0.0.0 to accept connections from other machines.
     `);
     return;
   }
@@ -503,13 +509,16 @@ Commands:
   const portIndex = args.indexOf('--port');
   const port = portIndex !== -1 ? parseInt(args[portIndex + 1], 10) : DEFAULT_PORT;
 
+  const hostIndex = args.indexOf('--host');
+  const host = hostIndex !== -1 ? args[hostIndex + 1] : '127.0.0.1';
+
   const platformIndex = args.indexOf('--platform');
   const targetPlatform = platformIndex !== -1 ? args[platformIndex + 1] : 'auto';
 
   if (command === 'serve') {
-    const server = new BridgeServer(port);
+    const server = new BridgeServer(port, host);
     await server.start();
-    console.log(`[BridgeServer] Listening on http/ws://0.0.0.0:${port}`);
+    console.log(`[BridgeServer] Listening on http/ws://${host}:${port}`);
     console.log(`[BridgeServer] Ready for ChatGPT / Claude / DeepSeek / Gemini / Kimi / Grok / Qwen / Doubao / GLM connections.`);
     return;
   }
@@ -589,9 +598,9 @@ Commands:
       }
     } catch {
       isTemporaryServer = true;
-      server = new BridgeServer(port);
+      server = new BridgeServer(port, host);
       await server.start();
-      console.log(`[BridgeServer] Started temporary bridge on ws/http://0.0.0.0:${port}`);
+      console.log(`[BridgeServer] Started temporary bridge on ws/http://${host}:${port}`);
 
       // Check if any tab connects immediately within 1.5 seconds before launching browser
       const alreadyOpen = await new Promise((resolveQuick) => {

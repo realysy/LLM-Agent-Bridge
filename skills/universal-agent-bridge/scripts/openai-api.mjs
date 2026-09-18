@@ -61,9 +61,11 @@ export function openBrowser(platform = 'chatgpt') {
 }
 
 export class OpenAIApiServer {
-  constructor(port = DEFAULT_PORT, apiKey = DEFAULT_API_KEY) {
+  constructor(port = DEFAULT_PORT, apiKey = DEFAULT_API_KEY, host = '127.0.0.1') {
     this.port = port;
     this.apiKey = apiKey;
+    // 默认只监听 loopback。开放到 0.0.0.0 需要显式传 host 参数。
+    this.host = host;
     this.clients = new Set();
     this.pendingRequests = new Map();
     this.server = null;
@@ -652,7 +654,7 @@ export class OpenAIApiServer {
         });
       });
 
-      this.server.listen(this.port, '0.0.0.0', () => {
+      this.server.listen(this.port, this.host, () => {
         resolveStart(this);
       });
 
@@ -1047,13 +1049,15 @@ async function main() {
   if (!command || command === '--help' || command === '-h') {
     console.log(`
 Usage:
-  node openai-api.mjs serve [--port 8765] [--api-key your-key]
+  node openai-api.mjs serve [--port 8765] [--host 127.0.0.1] [--api-key your-key]
 
 Commands:
   serve   Start OpenAI-compatible API server
 
 Options:
   --port       Port to listen on (default: 8765)
+  --host       Interface to bind (default: 127.0.0.1, loopback only).
+               Use 0.0.0.0 to accept connections from other machines.
   --api-key    API key for authentication (default: sk-bridge-local-key)
 
 API Endpoints:
@@ -1081,10 +1085,13 @@ curl http://localhost:8765/v1/chat/completions \\
   const keyIndex = args.indexOf('--api-key');
   const apiKey = keyIndex !== -1 ? args[keyIndex + 1] : DEFAULT_API_KEY;
 
+  const hostIndex = args.indexOf('--host');
+  const host = hostIndex !== -1 ? args[hostIndex + 1] : '127.0.0.1';
+
   if (command === 'serve') {
-    const server = new OpenAIApiServer(port, apiKey);
+    const server = new OpenAIApiServer(port, apiKey, host);
     await server.start();
-    console.log(`[OpenAIApiServer] Listening on http://0.0.0.0:${port}`);
+    console.log(`[OpenAIApiServer] Listening on http://${host}:${port}`);
     console.log(`[OpenAIApiServer] OpenAI-compatible API ready at /v1/chat/completions`);
     console.log(`[OpenAIApiServer] API Key: ${apiKey}`);
     console.log(`[OpenAIApiServer] Ready for ChatGPT / Claude / DeepSeek / Gemini / Kimi / Grok / Qwen / Doubao / GLM connections.`);
