@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Agent Bridge (Multi-Model Coding Matrix)
 // @namespace    https://github.com/realysy/LLM-Agent-Bridge
-// @version      0.6.2
+// @version      0.7.0
 // @description  Universal reasoning bridge connecting AI Agents with ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, and GLM Web.
 // @author       Universal Agent Community, realysy
 // @match        https://chatgpt.com/*
@@ -283,7 +283,15 @@
   function renderBlock(kind, content) {
     switch (kind) {
       case 'system':  return `SYSTEM: ${content}`;
-      case 'tools':   return `TOOLS: ${content}`;
+      // 工具定义用 JSON code block 包裹：模型侧普遍有 markdown 解析器，
+      // 裸 JSON 一行塞进去容易被当成普通文本忽略；代码块能明确标记
+      // "这是一份 JSON 数据"。
+      case 'tools':   return `TOOLS:\n\n\`\`\`json\n${content}\n\`\`\``;
+      case 'tool_protocol': return content;
+      case 'tool_result':   return content;
+      // 工具调用强化提示：content 已是完整文本，不需要额外包装。
+      // alwaysSend=true 保证每轮都注入。
+      case 'tool_reinforcement': return content;
       case 'context': return `CONTEXT: ${content}`;
       case 'turn':    return `USER: ${content}`;
       default:        return content;
@@ -1040,10 +1048,19 @@
     const blocks = Array.isArray(payload?.blocks) ? payload.blocks : null;
 
     if (blocks && blocks.length > 0) {
+      const wasResetPending = contextResetPending;
+
+      // 会话重置：清空 sentHashes，让 system / tools / tool_protocol
+      // 也从头发送。新网页对话里什么都没有，这些静态信息必须重发，
+      // 否则新对话的模型完全没有工具定义和系统提示。
+      if (wasResetPending) {
+        sentHashes.clear();
+      }
+
       const parts = [];
       let skipped = 0;
       let droppedByReset = 0;
-      const wasResetPending = contextResetPending;
+
       for (const block of blocks) {
         const kind = String(block?.kind || 'user');
         const content = String(block?.content || '');
@@ -1051,18 +1068,33 @@
 
         const hash = hashBlock(content);
 
-        // 会话刚重置：客户端侧的历史 context 全部丢弃，并加入 sentHashes
-        // 避免后续请求再次带上。system / tools 仍然发送，因为新网页对话
-        // 里确实没有它们；turn 永远发送。
-        if (contextResetPending && kind === 'context') {
+        // ① alwaysSend（workspace_info 等）：每轮都发。
+        //    优先级最高，绕过 sentHashes 和 contextResetPending。
+        //    不这样做的话，模型在第 2 轮之后会丢失工作区路径，
+        //    开始从 system prompt 里的零碎路径瞎拼假路径。
+        if (block?.alwaysSend) {
+          parts.push(renderBlock(kind, content));
+          sentHashes.add(hash);
+          continue;
+        }
+
+        // ② 会话刚重置：丢弃客户端侧的历史 context（模拟新会话）。
+        //    注意 alwaysSend 的 workspace_info 已经在 ① 里处理过了，
+        //    不会被这一段丢弃 —— 新会话反而更需要它。
+        if (wasResetPending && kind === 'context') {
           sentHashes.add(hash);
           skipped += 1;
           droppedByReset += 1;
           continue;
         }
 
-        // 只有 system / tools / context 参与去重；turn 永远发送
-        const dedupable = kind === 'system' || kind === 'tools' || kind === 'context';
+        // ③ 普通去重：system / tools / tool_protocol / context / tool_result
+        //    - system / tools / tool_protocol 静态内容，只发一次
+        //    - 历史 context（网页对话已保存）只发一次
+        //    - 历史 tool_result（网页对话已保存）只发一次
+        //    - turn 永远发送（本次新问题）
+        const dedupable = kind === 'system' || kind === 'tools' || kind === 'tool_protocol'
+          || kind === 'context' || kind === 'tool_result';
         if (dedupable && sentHashes.has(hash)) {
           skipped += 1;
           continue;
@@ -1072,12 +1104,11 @@
         sentHashes.add(hash);
       }
 
-      // 标志用一次即清空
       contextResetPending = false;
 
-      if (wasResetPending && droppedByReset > 0) {
+      if (wasResetPending) {
         console.log(
-          `[AgentBridge:${currentPlatform.name}] Session reset: dropped ${droppedByReset} context block(s)`
+          `[AgentBridge:${currentPlatform.name}] Session reset: cleared sentHashes, dropped ${droppedByReset} historical context block(s)`
         );
       }
       if (skipped > 0) {
@@ -1223,12 +1254,20 @@
       // 清空上一轮遗留的块状态：本次回答的所有块都是新内容，不需要继承上一轮的稳定计时。
       topLevelBlockState.clear();
 
-      // ---- 发送前快照：assistant 消息数量 + 最后一条文本 ----
+      // ---- 判断本轮是否为工具调用场景 ----
+      // 工具调用场景下不做流式上报：模型在流式期间会交错输出叙述和
+      // tool_call，中间态里 tool_call 常被截断/损坏，且用户真正关心的是
+      // 完整的工具调用结果而非过程。等网页完成一次性 /result 上报即可。
+      const hasTools = Array.isArray(payload?.blocks) &&
+        payload.blocks.some(b => b?.kind === 'tools');
+      
+      // ---- 发送前快照 ----
       const beforeSnapshot = captureAssistantSnapshot();
-      console.log(`[AgentBridge:${currentPlatform.name}] Snapshot before send:`, beforeSnapshot);
-
-      // 启动流式上报（在网页开始生成后，每 500ms 通过 /stream 推一次累积文本）
-      const streamReporter = startStreamReporter(requestId, beforeSnapshot);
+      
+      // 只有非工具调用场景才启动流式上报
+      const streamReporter = hasTools
+        ? { stop: async () => {} }   // 空实现
+        : startStreamReporter(requestId, beforeSnapshot);
 
       // Universal Input injection
       inputEl.focus();
@@ -1423,6 +1462,45 @@
   }
 
   /**
+   * 检测 KaTeX 渲染结构，恢复原始 $...$ / $$...$$。
+   * 返回 null 表示不是 KaTeX 元素，让调用方继续走通用分派。
+   *
+   * KaTeX 结构：
+   *   <span class="katex">                          ← inline
+   *     <span class="katex-mathml">
+   *       <math><semantics>...
+   *         <annotation encoding="application/x-tex">\frac{a}{b}</annotation>
+   *   </span>
+   *   <span class="katex-display">                  ← display 包裹层
+   *     <span class="katex">...
+   *
+   * 我们只需从 annotation 里取原始 LaTeX，重新用 $ / $$ 包起来。
+   */
+  function tryExtractKatex(node) {
+    if (!node.classList) return null;
+
+    // Display 模式最外层
+    if (node.classList.contains('katex-display')) {
+      const annotation = node.querySelector('.katex-mathml annotation[encoding^="application/x-tex"]');
+      if (!annotation) return null;
+      const tex = annotation.textContent || '';
+      if (!tex) return null;
+      return `\n$$${tex}$$\n\n`;
+    }
+
+    // Inline 模式（katex 类名，且不是 display 的子元素）
+    if (node.classList.contains('katex')) {
+      const annotation = node.querySelector('.katex-mathml annotation[encoding^="application/x-tex"]');
+      if (!annotation) return null;
+      const tex = annotation.textContent || '';
+      if (!tex) return null;
+      return `$${tex}$`;
+    }
+
+    return null;
+  }
+
+  /**
    * 判断元素是否是各平台表示"空行间隔"的占位元素（例如 Qwen 的
    * `.qwen-markdown-space`）。这些元素在判断"末尾块级元素"时应当被忽略，
    * 因为它们只是渲染上的间距，不代表新内容开始。
@@ -1602,6 +1680,10 @@
     if (node.nodeType !== 1) return '';
     if (shouldSkipElement(node)) return '';
 
+    // 优先恢复 KaTeX 数学公式
+    const katex = tryExtractKatex(node);
+    if (katex !== null) return katex;
+
     const tag = node.tagName.toLowerCase();
     switch (tag) {
       case 'br': return '\n';
@@ -1732,6 +1814,10 @@
     if (node.nodeType === 3) return node.textContent;
     if (node.nodeType !== 1) return '';
     if (shouldSkipElement(node)) return '';
+
+    // 优先恢复 KaTeX 数学公式
+    const katex = tryExtractKatex(node);
+    if (katex !== null) return katex;
 
     // 平台定制的代码块必须在通用标签分派之前判断
     const codeBlock = tryExtractCodeBlock(node, options);

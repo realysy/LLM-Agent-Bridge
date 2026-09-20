@@ -4,6 +4,51 @@
 
 The Universal Agent Bridge now provides an **OpenAI-compatible API endpoint** that allows any OpenAI-compatible client to route requests through browser-based AI platforms (ChatGPT, Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, Doubao, GLM).
 
+## Platform Support Status
+
+> **TL;DR** — 目前完成了 **DeepSeek** 和 **Qwen** 的主动适配与端到端测试。其它平台（ChatGPT / Claude / Gemini / Kimi / Grok / Doubao / GLM）的适配器与协议转换代码存在且逻辑上应当可用，但**未经测试**，不保证功能完整。
+
+### Support Matrix
+
+| Platform | Plain Chat | Thinking Mode | Streaming | Tool Use | Multi-turn Tools | Tested |
+|----------|-----------|---------------|-----------|----------|------------------|--------|
+| **DeepSeek** (`deepseek-web`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ 主动适配 + 测试 |
+| **Qwen** (`qwen-web`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ 主动适配 + 测试 |
+| ChatGPT (`chatgpt-web`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ 未测试 |
+| Claude (`claude-web`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ 未测试 |
+| Gemini (`gemini-web`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ 未测试 |
+| Kimi (`kimi-web`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ 未测试 |
+| Grok (`grok-web`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ 未测试 |
+| Doubao (`doubao-web`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ 未测试 |
+| GLM (`glm-web`) | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ 未测试 |
+
+**图例**：
+- ✅ — 已主动适配并通过端到端测试
+- ⚠️ — 代码路径存在，但**未经测试**, 可能存在解析错误/功能缺失等问题
+- ❌ — 未验证
+
+### What "Tested" Means
+
+「已测试」指以下场景均已通过端到端验证（见 [Tool Use (Function Calling)](#tool-use-function-calling) 与 [Debug Logging](#debug-logging)）：
+
+1. **普通问答** — 单轮对话、多轮对话（历史由网页对话自身维护）
+2. **思考模式** — DeepSeek 的 `已思考（用时 X 秒）` 与 Qwen 的 thinking 卡片均被正确剥离，不污染正式回答
+3. **流式输出** — 网页 500ms 采样累积文本，SSE 端 delta 实时推给客户端
+4. **工具调用** — 通过 VSCode Copilot（`deepseek-web` / `qwen-web`）验证：
+
+   测试步骤：[./agent-test-procedure.md](./agent-test-procedure.md)，观察：
+
+   - 单轮 tool_calls 解析与执行
+   - 多轮工具循环（create_file → read_file → run_in_terminal → …）
+   - 嵌套 / 缺少闭标签 / DeepSeek DSML 控制 token 等畸形容错
+5. **工具调用模式下的流式禁用** — 请求体含 `tools` 时 userscript 主动关闭 `/stream` 上报，等最终 DOM 一次性解析（避免中间态被 markdown / KaTeX 渲染器损坏）
+
+### Known Limitations
+
+- **未测试平台**：适配器使用平台通用的 DOM 选择器（如 `.markdown`、`[data-message-author-role]`），但各平台 UI 差异较大，不保证命中。欢迎 PR。
+- **工具调用与流式互斥**：启用 `tools` 时**不支持** SSE 增量推送。这是有意的设计取舍 —— 网页 UI 的实时渲染（KaTeX 吃 `$`、Markdown 解析器吞 `<`）会损坏工具调用 JSON，必须等最终 DOM 稳定后再提取。
+- **思考模式仅部分剥离**：DeepSeek 与 Qwen 的思考容器已识别并跳过。其它平台的思考/推理显示区（如 Claude 的 `thinking`、ChatGPT 的 o1 系列推理）**未做专门处理**，其内容可能会混入 `content`。
+
 ## Architecture
 
 ```
@@ -38,27 +83,32 @@ npm run api
 # Or directly
 node skills/universal-agent-bridge/scripts/openai-api.mjs serve
 
-# With custom port and API key
-node skills/universal-agent-bridge/scripts/openai-api.mjs serve --port 8765 --api-key my-secret-key
+# With custom host, port and API key
+node skills/universal-agent-bridge/scripts/openai-api.mjs serve --host 127.0.0.1 --port 8765 --api-key my-secret-key
 ```
 
 ### 2. Install Browser Userscript
 
 Make sure the Tampermonkey userscript is installed in your browser:
-- [GreasyFork Userscript](https://greasyfork.org/zh-CN/scripts/593912-universal-agent-bridge-multi-model-coding-matrix)
+- [GreasyFork Userscript](https://raw.githubusercontent.com/realysy/LLM-Agent-Bridge/main/browser/userscript/chatgpt-bridge.user.js)
+
+Remember to reload (Ctrl+F5) your LLM provider page after installation.
 
 ### 3. Open Your Preferred AI Platform
 
 Open and log in to any supported platform in your browser:
+- https://chat.deepseek.com
+- https://chat.qwen.ai
 - https://chatgpt.com
 - https://claude.ai
-- https://chat.deepseek.com
 - https://gemini.google.com
 - https://www.kimi.com
 - https://grok.com
 - https://tongyi.aliyun.com
 - https://www.doubao.com
 - https://chatglm.cn
+
+Keep page open and stay logged in.
 
 ## API Endpoints
 
@@ -199,22 +249,6 @@ curl http://localhost:8765/status
 
 否则本次上报被静默忽略，`accepted: false`，等下一次采样对齐。这是为了容忍浏览器 DOM 的瞬时抖动（React 双缓冲、Monaco 中间态等）。
 
-## Model Mapping
-
-The server automatically maps OpenAI-style model names to browser platforms:
-
-| Model Name Pattern | Platform |
-|-------------------|----------|
-| `chatgpt-web`, `gpt-*` | ChatGPT |
-| `claude-web`, `claude-*` | Claude |
-| `deepseek-web`, `deepseek-*` | DeepSeek |
-| `gemini-web`, `gemini-*` | Gemini |
-| `kimi-web`, `kimi-*` | Kimi |
-| `grok-web`, `grok-*` | Grok |
-| `qwen-web`, `qwen-*` | Qwen (通义千问) |
-| `doubao-web`, `doubao-*` | Doubao (豆包) |
-| `glm-web`, `glm-*` | GLM (智谱清言) |
-
 ## Authentication
 
 The default API key is `sk-bridge-local-key`. For production use, change it:
@@ -229,6 +263,163 @@ curl http://localhost:8765/v1/chat/completions \
   -H "Authorization: Bearer your-secure-key" \
   ...
 ```
+
+## Tool Use (Function Calling)
+
+The server bridges OpenAI-style `tools` / `tool_calls` to web models via a
+plain-text protocol. Web models emit tool calls in a strict block format;
+the server parses them back into standard OpenAI `tool_calls`.
+
+### Request with tools
+
+```bash
+curl http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer sk-bridge-local-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-web",
+    "messages": [
+      {"role": "user", "content": "list files in current dir"}
+    ],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Execute a bash command",
+        "parameters": {
+          "type": "object",
+          "properties": {"command": {"type": "string"}},
+          "required": ["command"]
+        }
+      }
+    }]
+  }'
+```
+
+### Response with tool_calls
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "model": "deepseek-web",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "I'll list the files in the current directory.",
+      "tool_calls": [{
+        "id": "call_...",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\":\"ls -la\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+OpenAI convention: `finish_reason` is `"tool_calls"` whenever at least one tool
+call is present; `content` is set to `null` if the model only emitted calls.
+
+### Model output protocol
+
+The server injects a `tool_protocol` block instructing the web model to emit
+each call in this exact form:
+
+```
+<tool_call>
+```json
+{"name": "<tool_name>", "arguments": {<json_arguments>}}
+```
+</tool_call>
+```
+
+The JSON is **inside a fenced code block** so the platform's markdown / KaTeX
+renderer doesn't corrupt `$…$`, `\"`, or `<…>` characters in arguments.
+
+### Multi-turn tool loop
+
+On each subsequent round, the agent client (Copilot, Claude Code, Cursor, etc.)
+sends back:
+
+- An `assistant` message carrying the previous `tool_calls` (ignored by the
+  bridge — the web conversation already holds the model's own output).
+- One or more `role: "tool"` messages with execution results. Each is mapped
+  by `tool_call_id` to the tool name via the assistant message's `tool_calls`
+  array and re-emitted as a `TOOL_RESULT (tool=<name>):` block.
+- The original `<workspace_info>` context block. This is marked `alwaysSend`
+  and re-injected every turn so the web model never loses the workspace path.
+
+### Deduplication
+
+The bridge dedupes unchanged blocks to save tokens:
+
+| Block kind | First turn | Subsequent turns |
+|------------|-----------|------------------|
+| `system` | sent | skipped |
+| `tools` (large JSON) | sent | skipped |
+| `tool_protocol` | sent | skipped |
+| `context` — historical user messages | sent | skipped |
+| `context` — `<workspace_info>` etc. | sent | **sent every turn** |
+| `tool_result` — historical | sent | skipped |
+| `turn` — current user message | sent | sent |
+
+When the user opens a new web chat (URL session token changes), the bridge
+clears the dedup set and drops historical context, simulating a fresh session.
+`alwaysSend` blocks (workspace info) are still re-injected — a fresh chat
+needs them most.
+
+### Parser tolerance
+
+`parseToolCallsFromContent` extracts tool calls by scanning for any valid
+`{"name": ..., "arguments": ...}` JSON object, **regardless of outer tag**.
+This tolerates models that:
+
+- Forget to close `</tool_call>`.
+- Nest `<tool_call>` blocks instead of writing them sequentially.
+- Emit `<｜｜DSML｜｜ calls>` or `<|tool_calls|>` control tokens.
+- Skip the wrapper tags entirely and emit bare JSON.
+
+`arguments` may be a JSON object or a JSON string; the server always returns
+it as a string per the OpenAI spec.
+
+### Streaming and tool calls
+
+When a request includes `tools`, the userscript **does not stream**. Web UIs
+frequently corrupt tool-call JSON mid-stream (KaTeX consuming `$`, markdown
+renderers eating `<`). The bridge waits for the final DOM, extracts the full
+markdown, and delivers the tool calls in one non-streamed round-trip.
+
+---
+
+## Debug Logging
+
+Set `BRIDGE_DEBUG_LOG=1` to persist every incoming `/v1/chat/completions`
+request body to `<repo-root>/logs/<timestamp>.json`. Off by default.
+
+```bash
+BRIDGE_DEBUG_LOG=1 npm run api
+```
+
+Filenames use the **local timezone** (millisecond precision), with `:`
+and `.` replaced by `-` for Windows compatibility:
+
+```
+logs/2026-09-20T11-27-28-853.json
+```
+
+Use cases:
+
+- Reproduce a client-side bug by replaying the exact request body.
+- Inspect the precise `messages` / `tools` payload an agent client sends.
+- Debug token blow-up from repeated context blocks.
+
+> A full multi-turn agent session can emit several MB of logs. Clean the
+> `logs/` directory periodically, and keep it in `.gitignore`.
 
 ## Using with OpenAI SDK
 

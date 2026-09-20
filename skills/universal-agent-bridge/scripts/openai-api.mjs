@@ -19,6 +19,9 @@ import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { exec } from 'node:child_process';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const DEFAULT_PORT = 8765;
@@ -48,6 +51,40 @@ const PLATFORM_MODELS = {
   doubao: { id: 'doubao-web', name: 'Doubao Web' },
   glm: { id: 'glm-web', name: 'GLM Web' },
 };
+
+// 是否启用调试日志
+const DEBUG_LOG_ENABLED = /^(1|true|yes)$/i.test(process.env.BRIDGE_DEBUG_LOG || '');
+
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = dirname(dirname(dirname(SCRIPT_DIR)));
+const DEBUG_LOG_DIR = join(REPO_ROOT, 'logs');  // 日志文件路径: <repo_root>/logs/
+
+/**
+ * 本地时区 ISO-ish 时间戳，毫秒精度。
+ * 用 '-' 替换 ':' 和 '.'，兼容 Windows 文件名（不允许冒号）。
+ * 示例：2026-09-20T11-27-28-853
+ */
+function formatLocalTimestamp(date = new Date()) {
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    + `T${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
+    + `-${pad(date.getMilliseconds(), 3)}`;
+}
+
+/**
+ * 把原始请求体落盘。启用时才执行。
+ * 任何 IO 错误都只 warn，不影响主流程。
+ */
+function dumpDebugRequest(data) {
+  if (!DEBUG_LOG_ENABLED) return;
+  try {
+    mkdirSync(DEBUG_LOG_DIR, { recursive: true });
+    const file = join(DEBUG_LOG_DIR, `${formatLocalTimestamp()}.json`);
+    writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn('[DebugLog] failed to persist request:', e.message);
+  }
+}
 
 export function openBrowser(platform = 'chatgpt') {
   const url = PLATFORM_URLS[platform] || PLATFORM_URLS.chatgpt;
@@ -83,6 +120,12 @@ export class OpenAIApiServer {
 
     // Request ID counter for OpenAI compatibility
     this.requestIdCounter = 0;
+
+    // 上一次工具调用的结果，用于在下一轮 tool_protocol 后注入强化提示：
+    //   'success' — 上一轮解析出了 tool_calls（协议遵守）
+    //   'failure' — 上一轮原文里有工具调用标记，但解析出 0 个 tool_calls（协议没被遵守）
+    //   null      — 尚未观测到工具调用轮次，或上一轮根本不是工具轮次
+    this.lastToolUseOutcome = null;
   }
 
   setCorsHeaders(res) {
@@ -215,6 +258,9 @@ export class OpenAIApiServer {
               return;
             }
 
+            // 调试用：落盘原始请求（BRIDGE_DEBUG_LOG=1 时启用）
+            dumpDebugRequest(data);
+
             const wantsStream = data.stream === true;
 
             // ==================== 流式（SSE）分支 ====================
@@ -315,35 +361,44 @@ export class OpenAIApiServer {
                 writeDone();
               }, 5 * 60 * 1000);
 
-              // 发起 handoff（不 await；真正的推送逻辑由 /stream 驱动）
               this.handleChatCompletion(data, { requestId: handoffRequestId })
                 .then((result) => {
                   if (streamState.finished) return;
 
-                  // 浏览器已在推 /stream：不做兼容路径，等 done 帧处理。
-                  // 只有当 pushedLength === 0（浏览器完全没推 /stream）时才走兼容路径。
-                  if (streamState.pushedLength > 0) {
-                    // 兜底：如果 10 秒内 done 帧仍未来到，用 result 强制收尾
+                  const choice = result.choices?.[0];
+                  const message = choice?.message || {};
+                  const finishReason = choice?.finish_reason || 'stop';
+                  const toolCalls = message.tool_calls;
+                  const cleanContent = message.content || '';
+
+                  if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+                    if (!aborted) {
+                      // 不再推 content tail —— tool_calls 场景下 content 应当为空
+                      writeChunk({ tool_calls: this.buildToolCallsDelta(toolCalls) });
+                      writeChunk({}, 'tool_calls');
+                    }
+                  } else if (streamState.pushedLength > 0) {
+                    // 浏览器已在推 /stream：等 done 帧处理，最多等 10 秒
                     setTimeout(() => {
                       if (streamState.finished) return;
-                      const content = result.choices?.[0]?.message?.content || '';
-                      const tail = content.slice(streamState.pushedLength);
+                      const tail = cleanContent.slice(streamState.pushedLength);
                       if (!aborted && tail) writeChunk({ content: tail });
-                      if (!aborted) writeChunk({}, 'stop');
+                      if (!aborted) writeChunk({}, finishReason);
                       streamState.finished = true;
                       if (streamState.timer) clearTimeout(streamState.timer);
                       this.streamingOutputs.delete(handoffRequestId);
                       writeDone();
                     }, 10000);
                     return;
+                  } else {
+                    // 兼容路径：浏览器完全没推 /stream
+                    const tail = cleanContent.slice(streamState.pushedLength);
+                    if (!aborted && tail) {
+                      writeChunk({ content: tail });
+                    }
+                    if (!aborted) writeChunk({}, finishReason);
                   }
 
-                  const content = result.choices?.[0]?.message?.content || '';
-                  const tail = content.slice(streamState.pushedLength);
-                  if (!aborted && tail) {
-                    writeChunk({ content: tail });
-                  }
-                  if (!aborted) writeChunk({}, 'stop');
                   if (!aborted && data.stream_options?.include_usage) {
                     const usageChunk = {
                       id: requestId,
@@ -503,7 +558,10 @@ export class OpenAIApiServer {
             }
 
             const { request_id: requestId, text, done } = data;
-            const newText = String(text || '');
+            const rawText = String(text || '');
+            // 移除 <tool_call> 块：用户不应该在流式输出里看到工具调用指令。
+            // 最终工具调用信息由 .then() 分支单独发出。
+            const newText = this.cleanStreamText(rawText);
             const isDone = done === true;
 
             const state = this.streamingOutputs.get(requestId);
@@ -539,18 +597,13 @@ export class OpenAIApiServer {
             }
 
             if (isDone) {
-              if (!isAborted() && !state.finished) {
-                const tail = newText.slice(state.pushedLength);
-                if (tail) {
-                  state.writeChunk({ content: tail });
-                  state.pushedLength = newText.length;
-                }
-                state.writeChunk({}, 'stop');
-              }
-              state.finished = true;
-              if (state.timer) clearTimeout(state.timer);
-              this.streamingOutputs.delete(requestId);
-              if (!isAborted()) state.writeDone();
+              // 只标记浏览器已结束推送；最终输出由 handleChatCompletion 的
+              // .then() 分支决定（因为可能包含 tool_calls chunk）。
+              // 不做 writeDone()，也不 delete state —— 让 .then() 收尾。
+              state.browserDone = true;
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, accepted: accept, deferred: true }));
+              return;
             }
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -695,7 +748,10 @@ export class OpenAIApiServer {
 
   /**
    * Handle OpenAI Chat Completions API
-   * Converts OpenAI request format to bridge packet and routes to browser
+   * Converts OpenAI request format to bridge packet and routes to browser.
+   *
+   * 如果网页模型返回的内容中包含 <tool_call> 块，会解析成 OpenAI 的
+   * tool_calls 结构，并设置 finish_reason='tool_calls'。
    */
   async handleChatCompletion(openAiRequest, options = {}) {
     const {
@@ -727,9 +783,44 @@ export class OpenAIApiServer {
       requestId: options.requestId,
     });
 
+    const rawContent = result.content || '';
+    const { toolCalls, cleanContent } = this.parseToolCallsFromContent(rawContent);
+
+    // 更新"上次工具调用结果"，供下一轮 buildBlocks 生成强化提示时使用：
+    //   - 解析出 toolCalls → 'success'（协议被遵守）
+    //   - 没解析出但原文有工具调用标记 → 'failure'（模型走偏了）
+    //   - 都没出现 → 保持原状态（本轮不是工具调用轮次）
+    if (Array.isArray(tools) && tools.length > 0) {
+      const prev = this.lastToolUseOutcome;
+      if (toolCalls.length > 0) {
+        this.lastToolUseOutcome = 'success';
+      } else {
+        // 全角竖线 U+FF5C 组成的 DeepSeek DSML token，与半角 `|` 不通用
+        const hasMarkers =
+          rawContent.includes('<tool_call') ||
+          rawContent.includes('<｜｜DSML｜｜') ||
+          rawContent.includes('<|tool_calls');
+        if (hasMarkers) {
+          this.lastToolUseOutcome = 'failure';
+        }
+      }
+      if (this.lastToolUseOutcome !== prev) {
+        console.log(`[ToolUse] outcome: ${prev ?? '(none)'} -> ${this.lastToolUseOutcome}`);
+      }
+    }
+
     // Generate OpenAI-compatible response
     const requestId = `chatcmpl-${Date.now()}-${++this.requestIdCounter}`;
     const timestamp = Math.floor(Date.now() / 1000);
+
+    const message = {
+      role: 'assistant',
+      // OpenAI 规范：有 tool_calls 时 content 通常为 null
+      content: toolCalls.length > 0 ? (cleanContent || null) : (rawContent || ''),
+    };
+    if (toolCalls.length > 0) {
+      message.tool_calls = toolCalls;
+    }
 
     return {
       id: requestId,
@@ -739,17 +830,14 @@ export class OpenAIApiServer {
       choices: [
         {
           index: 0,
-          message: {
-            role: 'assistant',
-            content: result.content || '',
-          },
-          finish_reason: 'stop',
+          message,
+          finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
         },
       ],
       usage: {
         prompt_tokens: this.estimateTokens(prompt),
-        completion_tokens: this.estimateTokens(result.content || ''),
-        total_tokens: this.estimateTokens(prompt) + this.estimateTokens(result.content || ''),
+        completion_tokens: this.estimateTokens(rawContent),
+        total_tokens: this.estimateTokens(prompt) + this.estimateTokens(rawContent),
       },
       system_fingerprint: 'universal-agent-bridge',
     };
@@ -785,13 +873,31 @@ export class OpenAIApiServer {
   }
 
   /**
+   * 判断一条 user context 是否属于"每轮都必须重新投喂"的环境信息。
+   *
+   * Copilot 每轮都会把这些块原样带上（hash 相同），我们的 sentHashes
+   * 去重会命中并跳过 —— 但模型确实每轮都需要它们才能正常工作：
+   * 尤其是 <workspace_info> 里的工作区路径。跳过后模型会从 system
+   * prompt 里的零碎路径（如 VSCODE_TARGET_SESSION_LOG）瞎拼出
+   * /opt/.../workspaceStorage/<uuid> 这种假路径。
+   *
+   * 这类块体积小（几百 token），每轮重发的成本可控；相比丢失路径
+   * 导致的工具调用失败，代价可以忽略。
+   */
+  isPersistentContext(content) {
+    return /<environment_info>|<workspace_info>|<userMemory>|<sessionMemory>|<repoMemory>/.test(content);
+  }
+
+  /**
    * 把 messages 拆成带类型的 blocks，供浏览器端做增量去重。
    *
    * block kind 分类：
-   *   system  - role=system 的消息
-   *   tools   - 请求体顶层的 tools 数组（序列化后作为单个 block）
-   *   context - 非最后一条 role=user 的消息（历史 + 环境上下文等）
-   *   turn    - 最后一条 role=user 的消息（本次新问题，永不去重）
+   *   system        - role=system 的消息
+   *   tools         - 请求体顶层的 tools 数组（JSON 序列化后作为单个 block）
+   *   tool_protocol - 工具调用格式说明（仅当请求带 tools 时生成）
+   *   context       - 非最后一条 role=user 的消息（历史 + 环境上下文等）
+   *   tool_result   - role=tool 的消息（工具执行结果），按 call_id 关联工具名
+   *   turn          - 最后一条 role=user 的消息（本次新问题，永不去重）
    *
    * assistant 消息一律忽略：网页对话本身已有历史，不需要重复注入。
    *
@@ -818,30 +924,470 @@ export class OpenAIApiServer {
       if (content) blocks.push({ kind: 'system', content });
     }
 
-    // 2) tools（序列化后作为单个 block）
+    // 2) tools + tool_protocol + tool_reinforcement
     if (Array.isArray(tools) && tools.length > 0) {
       blocks.push({ kind: 'tools', content: JSON.stringify(tools) });
+      blocks.push({
+        kind: 'tool_protocol',
+        content: this.buildToolProtocolPrompt(tools),
+      });
+
+      // 根据上一轮的成功/失败，注入针对性强化提示。
+      // 独立 block + alwaysSend：每轮都发，不污染 tool_protocol 的 hash。
+      const reinforcement = this.buildToolReinforcement(this.lastToolUseOutcome);
+      if (reinforcement) {
+        blocks.push({
+          kind: 'tool_reinforcement',
+          content: reinforcement,
+          alwaysSend: true,
+        });
+      }
     }
 
-    // 3) 定位最后一条 user，用于区分 context / turn
+    // 3) 建立 tool_call_id -> tool_name 的映射
+    // Copilot 会把上一轮 bridge 返回的 tool_calls 原样带回来，
+    // 每个 id 对应一个工具名。tool 消息只带 id，需要靠这个映射恢复工具名。
+    const toolCallMap = new Map();
+    for (const m of messages) {
+      if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          if (tc?.id && tc?.function?.name) {
+            toolCallMap.set(tc.id, tc.function.name);
+          }
+        }
+      }
+    }
+
+    // 4) 定位最后一条 user，用于区分 context / turn
     let lastUserIdx = -1;
     for (let i = 0; i < messages.length; i += 1) {
       if (messages[i]?.role === 'user') lastUserIdx = i;
     }
 
-    // 4) user 消息
+    // 5) 按顺序生成 blocks
     for (let i = 0; i < messages.length; i += 1) {
       const m = messages[i];
-      if (m?.role !== 'user') continue;
-      const content = contentOf(m);
-      if (!content) continue;
-      blocks.push({
-        kind: i === lastUserIdx ? 'turn' : 'context',
-        content,
-      });
+      if (!m) continue;
+
+      if (m.role === 'system') continue;    // 已处理
+      if (m.role === 'assistant') continue; // 网页模型自己记得它的输出
+
+      if (m.role === 'user') {
+        const content = contentOf(m);
+        if (!content) continue;
+        const isTurn = i === lastUserIdx;
+        blocks.push({
+          kind: isTurn ? 'turn' : 'context',
+          content,
+          // 环境/工作区/记忆类上下文：每轮都发，不参与去重
+          alwaysSend: !isTurn && this.isPersistentContext(content),
+        });
+        continue;
+      }
+
+      if (m.role === 'tool') {
+        const callId = m.tool_call_id;
+        const toolName = (callId && toolCallMap.get(callId)) || 'unknown_tool';
+        const content = contentOf(m) || '(empty result)';
+        blocks.push({
+          kind: 'tool_result',
+          content: `TOOL_RESULT (tool=${toolName}):\n${content}`,
+        });
+        continue;
+      }
     }
 
     return blocks;
+  }
+
+  /**
+   * 生成工具调用协议说明。仅当请求带 tools 时生成，作为独立 block
+   * 发送给网页模型，明确要求它按 <tool_call> 格式输出。
+   *
+   * 不这样做的话，模型会按它自己训练过的格式输出（例如 DeepSeek 的
+   * <｜｜DSML｜｜ calls>、OpenAI 的 function_call XML、markdown json
+   * 代码块等），agent 客户端无法解析。
+   *
+   * 设计要点（来自实测踩过的坑）：
+   *   1) 模型倾向于在 tool_call 前后加"我先看看..."这类叙述 —— 必须禁止
+   *   2) 模型偶尔会多吐一个 </tool_call> —— 必须显式强调"唯一闭标签"
+   *   3) 模型不知道工作区路径时会从 system prompt 里抓零碎片段瞎拼
+   *      （如把 VSCODE_TARGET_SESSION_LOG 里的 UUID 当成 cwd）——
+   *      必须要求路径未知时先探测，绝不允许猜测
+   *   4) 模型偶尔会在 tool_call 后继续输出最终答案 —— 必须明确"emit 后
+   *      立即停止，等待 TOOL_RESULT"
+   */
+  buildToolProtocolPrompt(tools) {
+    const toolNames = tools
+      .map((t) => t?.function?.name)
+      .filter((n) => typeof n === 'string')
+      .join(', ');
+
+    return [
+      'TOOL CALLING PROTOCOL',
+      '',
+      'You are connected to an external tool runner. You may invoke tools to complete the user\'s request. Follow the rules below EXACTLY — the runner parses your output mechanically and cannot tolerate deviations.',
+      '',
+      '### Invocation format',
+      '',
+      'To invoke a tool, emit a block in EXACTLY this form:',
+      '',
+      '<tool_call>',
+      '```json',
+      '{"name": "<tool_name>", "arguments": {<json_arguments>}}',
+      '```',
+      '</tool_call>',
+      '',
+      '### Hard rules',
+      '',
+      '1. OUTPUT SHAPE. When you decide to call tools, your entire response MUST consist solely of one or more <tool_call> blocks. Do NOT output any prose, greeting, acknowledgement, plan, explanation, or trailing summary — not before, not between, not after the blocks.',
+      '2. JSON INSIDE CODE FENCE. The JSON object MUST be inside a fenced code block tagged exactly ```json, and that code block MUST be wrapped by <tool_call> ... </tool_call>. The fence is REQUIRED because the runner reads the JSON from the rendered code block; without it your arguments may be corrupted by the UI\'s markdown renderer.',
+      '3. ONE TAG PER BLOCK. Each <tool_call> block opens with exactly one <tool_call> tag and closes with exactly one </tool_call> tag. Never emit duplicate or stray closing tags.',
+      '4. NO NESTING. Never nest one <tool_call> block inside another. For multiple tools, emit each block sequentially: close the first </tool_call> BEFORE opening the next <tool_call>.',
+      '5. NO CONTROL TOKENS. Never emit model-specific control tokens such as <｜｜DSML｜｜ calls> or <|tool_calls|>. They will be rejected by the runner.',
+      '6. ARGUMENTS. "arguments" MUST be a JSON object (not a string) whose fields match the tool\'s parameter schema. Include every required field. Use correct JSON types (numbers as numbers, booleans as booleans).',
+      '7. STOP AFTER EMITTING. Immediately after the last </tool_call> tag, STOP. Do not continue with the final answer. The runner will execute the calls and reply with one TOOL_RESULT block per call.',
+      '8. PATHS. Whenever a parameter expects a file or directory path, provide an ABSOLUTE path. If you do not know the current working directory, do NOT guess or infer it from unrelated context — first call a tool that reveals it (for example, run `pwd` in the terminal) and wait for its result.',
+      '9. WHEN TO FINISH. When you no longer need any tool — i.e. you can answer the user directly — respond with the final answer as plain text, WITHOUT any <tool_call> block.',
+      '',
+      '### Positive example',
+      '',
+      'User asks to list the workspace. Correct response (entire response, nothing else):',
+      '',
+      '<tool_call>',
+      '```json',
+      '{"name": "list_dir", "arguments": {"path": "/home/user/project"}}',
+      '```',
+      '</tool_call>',
+      '',
+      '### Negative examples — never produce output like these',
+      '',
+      'WRONG (JSON not wrapped in a code fence):',
+      '  <tool_call>{"name": "list_dir", "arguments": {"path": "/"}}</tool_call>',
+      '',
+      'WRONG (extra prose around the block):',
+      '  Sure, I\'ll list the directory first.',
+      '  <tool_call>',
+      '  ```json',
+      '  {"name": "list_dir", "arguments": {"path": "/"}}',
+      '  ```',
+      '  </tool_call>',
+      '',
+      'WRONG (two tool_calls nested instead of sequential):',
+      '  <tool_call><tool_call>...</tool_call></tool_call>',
+      '',
+      '### Available tools',
+      '',
+      toolNames || '(none)',
+    ].join('\n');
+  }
+
+  /**
+   * 生成工具调用格式的强化提示。
+   *
+   * 目的：通过正向/负向反馈提高模型遵守协议的概率。
+   *   - 上一轮解析成功 → 正向强化，鼓励保持格式
+   *   - 上一轮解析失败 → 纠正提示，明确要求重试正确格式
+   *   - 尚未观测到工具调用 → 返回 null，不注入
+   *
+   * 作为**独立 block**（kind='tool_reinforcement'）发送，不污染
+   * tool_protocol 的 hash —— 后者是静态去重的，混入动态内容会让它
+   * 每轮都重发，失去去重意义。
+   *
+   * 该 block 带 alwaysSend=true，每轮都随请求注入。
+   */
+  buildToolReinforcement(status) {
+    if (status !== 'success' && status !== 'failure') return null;
+
+    const example = [
+      '<tool_call>',
+      '```json',
+      '{"name": "<tool_name>", "arguments": {<json_arguments>}}',
+      '```',
+      '</tool_call>',
+    ].join('\n');
+
+    if (status === 'success') {
+      return [
+        'TOOL CALL FORMAT — REINFORCEMENT',
+        '',
+        'GREAT — your previous tool call was parsed successfully. Keep emitting tool calls in EXACTLY the same format:',
+        '',
+        example,
+        '',
+        'Do not deviate. Continue using this exact format for every subsequent call.',
+      ].join('\n');
+    }
+
+    // status === 'failure'
+    return [
+      'TOOL CALL FORMAT — CORRECTION',
+      '',
+      'WRONG — your previous round failed because the tool call was NOT in the required format. You MUST use EXACTLY this format:',
+      '',
+      example,
+      '',
+      'Do NOT use DSML (e.g. <｜｜DSML｜｜ …), function_call XML, <|tool_calls|>, bare JSON, or any other syntax. The <tool_call> wrapper AND the ```json code fence are both REQUIRED. Retry the same tool call using the format above.',
+    ].join('\n');
+  }
+
+  /**
+   * DeepSeek DSML 工具调用解析器（兜底）。
+   *
+   * 协议（tool_protocol block）已明确要求 JSON 格式，模型在绝大多数
+   * 轮次会遵守。但当上下文变长或模型"走神"时，它会退化到训练语料里
+   * 见过的 DSML 格式。这个解析器负责接住这种情况。
+   *
+   * 实测遇到两种形态，都要兼容：
+   *
+   *   形态 A（逐参数）：
+   *     <｜｜DSML｜｜ parameter name="filePath" string="true">/a/b.txt</｜｜DSML｜｜ parameter>
+   *     <｜｜DSML｜｜ parameter name="startLine" string="false">1</｜｜DSML｜｜ parameter>
+   *     → arguments = { filePath: "/a/b.txt", startLine: 1 }
+   *
+   *   形态 B（打包 arguments）：
+   *     <｜｜DSML｜｜ parameter name="arguments" string="false">{"path": "/a"}</｜｜DSML｜｜ parameter>
+   *     → arguments = { path: "/a" }
+   *
+   * 判定规则：若参数里只有唯一的 `arguments` 键且值是对象，直接展开。
+   *
+   * 返回 { calls, stripped }：calls 是 OpenAI tool_calls，stripped 是
+   * 移除 DSML 块后的剩余文本（供后续 JSON 扫描使用）。
+   */
+  parseDsmlToolCalls(content) {
+    const calls = [];
+    if (!content) return { calls, stripped: '' };
+
+    const blocksToRemove = [];
+    let stripped = content;
+
+    const callsRegex = /<｜｜DSML｜｜\s*calls>([\s\S]*?)<\/｜｜DSML｜｜\s*calls>/g;
+    const invokeRegex = /<｜｜DSML｜｜\s*invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*invoke>/g;
+    const paramRegex = /<｜｜DSML｜｜\s*parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*parameter>/g;
+
+    let callsMatch;
+    while ((callsMatch = callsRegex.exec(content)) !== null) {
+      const inner = callsMatch[1];
+      invokeRegex.lastIndex = 0;
+
+      let invokeMatch;
+      while ((invokeMatch = invokeRegex.exec(inner)) !== null) {
+        const toolName = invokeMatch[1];
+        const paramsBlock = invokeMatch[2];
+        const rawArgs = {};
+
+        paramRegex.lastIndex = 0;
+        let paramMatch;
+        while ((paramMatch = paramRegex.exec(paramsBlock)) !== null) {
+          const pName = paramMatch[1];
+          // string="true" 或缺省 => 值按字符串处理；string="false" => 尝试 JSON.parse
+          const pIsString = paramMatch[2] !== 'false';
+          const pValue = paramMatch[3];
+          if (pIsString) {
+            rawArgs[pName] = pValue;
+          } else {
+            try { rawArgs[pName] = JSON.parse(pValue); }
+            catch { rawArgs[pName] = pValue; }
+          }
+        }
+
+        // 形态 B 展开：只有唯一的 arguments 键，且值是对象
+        let finalArgs = rawArgs;
+        const keys = Object.keys(rawArgs);
+        if (keys.length === 1 && keys[0] === 'arguments'
+            && rawArgs.arguments && typeof rawArgs.arguments === 'object') {
+          finalArgs = rawArgs.arguments;
+        }
+
+        if (toolName) {
+          calls.push({
+            id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+            type: 'function',
+            function: {
+              name: toolName,
+              arguments: JSON.stringify(finalArgs),
+            },
+          });
+        }
+      }
+
+      blocksToRemove.push([callsMatch.index, callsMatch.index + callsMatch[0].length]);
+    }
+
+    for (let i = blocksToRemove.length - 1; i >= 0; i--) {
+      const [s, e] = blocksToRemove[i];
+      stripped = stripped.slice(0, s) + stripped.slice(e);
+    }
+
+    return { calls, stripped };
+  }
+
+  /**
+   * 从网页模型的原始输出里提取工具调用。
+   *
+   * 解析顺序（两条路径互补，不互斥）：
+   *   1) DSML 兜底 —— 模型走偏到自己的训练格式时接住
+   *   2) JSON 协议 —— 模型遵守 tool_protocol 时的正常路径
+   *
+   * 先跑 DSML 是因为它的块里没有 {…}，JSON 扫描抓不到，必须单独处理。
+   * DSML 块被剥离后，剩余文本再走 JSON 扫描，互不干扰。
+   */
+  parseToolCallsFromContent(content) {
+    const toolCalls = [];
+    if (!content) return { toolCalls, cleanContent: '' };
+
+    // ---- 1) DSML 兜底解析 ----
+    const { calls: dsmlCalls, stripped } = this.parseDsmlToolCalls(content);
+    toolCalls.push(...dsmlCalls);
+    let working = stripped;
+
+    // ---- 2) JSON 协议解析 ----
+    const consumedRanges = [];
+    const jsonObjects = this.extractJsonObjects(working);
+
+    for (const { json, start, end } of jsonObjects) {
+      let obj;
+      try { obj = JSON.parse(json); } catch { continue; }
+      if (!obj || typeof obj !== 'object') continue;
+      if (typeof obj.name !== 'string') continue;
+      if (!('arguments' in obj)) continue;
+
+      const args = obj.arguments;
+      toolCalls.push({
+        id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+        type: 'function',
+        function: {
+          name: obj.name,
+          arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        },
+      });
+      consumedRanges.push([start, end]);
+    }
+
+    let cleanContent = working;
+    for (let i = consumedRanges.length - 1; i >= 0; i--) {
+      const [s, e] = consumedRanges[i];
+      cleanContent = cleanContent.slice(0, s) + cleanContent.slice(e);
+    }
+
+    cleanContent = this.stripToolSyntax(cleanContent);
+    return { toolCalls, cleanContent };
+  }
+
+  /**
+   * 扫描文本中所有形如 {...} 的平衡 JSON 片段，返回其中**含 `"name":`
+   * 字段的候选对象**。
+   *
+   * 为什么要预检 `"name"`：
+   *   本函数的调用方只有 parseToolCallsFromContent，它只关心
+   *   tool_call 对象（必须有顶层 name）。其他 JSON（比如用户提供的
+   *   schema、嵌套的 arguments 内容）直接跳过，可以省下一次
+   *   JSON.parse，也不会污染候选集。
+   *
+   * 为什么用括号平衡而不是正则：
+   *   - 正确处理嵌套对象/数组
+   *   - 正确处理字符串字面量里的 { } 和转义字符 \"
+   *   - 遇到未闭合的 { 时只跳过它，不影响后续扫描
+   *     （历史 bug：曾经 break，导致前面任何一个孤立 { 就丢弃全部）
+   *
+   * 返回 [{ json, start, end }, ...]，按出现顺序排列。
+   */
+  extractJsonObjects(text) {
+    const results = [];
+    if (!text) return results;
+    const n = text.length;
+
+    for (let i = 0; i < n; i++) {
+      if (text[i] !== '{') continue;
+
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      let end = -1;
+
+      for (let j = i; j < n; j++) {
+        const c = text[j];
+        if (escaped) { escaped = false; continue; }
+        if (c === '\\') { escaped = true; continue; }
+        if (c === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (c === '{') {
+          depth++;
+        } else if (c === '}') {
+          depth--;
+          if (depth === 0) { end = j; break; }
+        }
+      }
+
+      if (end === -1) continue;   // 这个 { 没配对，跳过它继续找下一个
+
+      const json = text.slice(i, end + 1);
+      if (!/"name"\s*:/.test(json)) continue;   // 不跳 i，允许扫到内层
+      results.push({ json, start: i, end: end + 1 });
+      i = end;   // 只有识别为 tool_call 才跳过
+    }
+
+    return results;
+  }
+
+  /**
+   * 清理模型输出里各种"工具调用语法残留"：
+   *   - <tool_call> / </tool_call> 成对或孤立标签
+   *   - DeepSeek 特有 token：<｜｜DSML｜｜ ...> 或 </｜｜...>
+   *   - 通用特殊 token：<|...|>
+   */
+  stripToolSyntax(text) {
+    if (!text) return '';
+    return text
+      .replace(/<\/?tool_call>/g, '')
+      // 兜底 1：成对的 DSML 块（invoke / parameter），连同内容一并删除。
+      // 主要防畸形输入（模型写了开头忘了结尾，导致 parseDsmlToolCalls
+      // 匹配不到完整块）。
+      .replace(/<｜｜DSML｜｜[^>]*>[\s\S]*?<\/｜｜DSML｜｜[^>]*>/g, '')
+      // 兜底 2：自闭合或单侧的 DSML 标签（如 <｜｜DSML｜｜ calls>）
+      .replace(/<\/?｜[^>]*>/g, '')
+      // 通用特殊 token：<|...|> / <|...>
+      .replace(/<\|[^>]*?\|>/g, '')
+      .replace(/<\|[^>]*>/g, '')
+      .replace(/```json\s*```/g, '')
+      .replace(/```\s*```/g, '')
+      .trim();
+  }
+
+  /**
+   * 流式推送时对累积文本做清理：
+   *   - 移除已闭合的 <tool_call>...</tool_call> 块
+   *   - 遇到未闭合的 <tool_call> 或 DeepSeek 特殊 token 起始（<｜），
+   *     截断到它之前，避免 tool_call 内容被流式推给用户
+   *
+   * 真正的工具调用信息会由最终帧的 tool_calls chunk 单独发出。
+   */
+  cleanStreamText(text) {
+    if (!text) return '';
+    let result = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
+
+    const markers = ['<tool_call>', '<｜'];
+    let cutAt = result.length;
+    for (const m of markers) {
+      const i = result.indexOf(m);
+      if (i !== -1 && i < cutAt) cutAt = i;
+    }
+    return result.slice(0, cutAt);
+  }
+
+  /**
+   * 把 tool_calls 数组转换成 OpenAI SSE 的 delta 结构。
+   */
+  buildToolCallsDelta(toolCalls) {
+    return toolCalls.map((tc, idx) => ({
+      index: idx,
+      id: tc.id,
+      type: tc.type,
+      function: {
+        name: tc.function.name,
+        arguments: tc.function.arguments,
+      },
+    }));
   }
 
   /**
@@ -1091,7 +1637,10 @@ curl http://localhost:8765/v1/chat/completions \\
   if (command === 'serve') {
     const server = new OpenAIApiServer(port, apiKey, host);
     await server.start();
-    console.log(`[OpenAIApiServer] Listening on http://${host}:${port}`);
+    // --port 0 时 OS 会分配随机端口，日志必须打实际端口，
+    // 否则测试无法得知该连到哪。
+    const actualPort = server.server.address().port;
+    console.log(`[OpenAIApiServer] Listening on http://${host}:${actualPort}`);
     console.log(`[OpenAIApiServer] OpenAI-compatible API ready at /v1/chat/completions`);
     console.log(`[OpenAIApiServer] API Key: ${apiKey}`);
     console.log(`[OpenAIApiServer] Ready for ChatGPT / Claude / DeepSeek / Gemini / Kimi / Grok / Qwen / Doubao / GLM connections.`);
