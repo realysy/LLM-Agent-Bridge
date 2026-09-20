@@ -315,35 +315,44 @@ export class OpenAIApiServer {
                 writeDone();
               }, 5 * 60 * 1000);
 
-              // 发起 handoff（不 await；真正的推送逻辑由 /stream 驱动）
               this.handleChatCompletion(data, { requestId: handoffRequestId })
                 .then((result) => {
                   if (streamState.finished) return;
 
-                  // 浏览器已在推 /stream：不做兼容路径，等 done 帧处理。
-                  // 只有当 pushedLength === 0（浏览器完全没推 /stream）时才走兼容路径。
-                  if (streamState.pushedLength > 0) {
-                    // 兜底：如果 10 秒内 done 帧仍未来到，用 result 强制收尾
+                  const choice = result.choices?.[0];
+                  const message = choice?.message || {};
+                  const finishReason = choice?.finish_reason || 'stop';
+                  const toolCalls = message.tool_calls;
+                  const cleanContent = message.content || '';
+
+                  if (Array.isArray(toolCalls) && toolCalls.length > 0) {
+                    if (!aborted) {
+                      // 不再推 content tail —— tool_calls 场景下 content 应当为空
+                      writeChunk({ tool_calls: this.buildToolCallsDelta(toolCalls) });
+                      writeChunk({}, 'tool_calls');
+                    }
+                  } else if (streamState.pushedLength > 0) {
+                    // 浏览器已在推 /stream：等 done 帧处理，最多等 10 秒
                     setTimeout(() => {
                       if (streamState.finished) return;
-                      const content = result.choices?.[0]?.message?.content || '';
-                      const tail = content.slice(streamState.pushedLength);
+                      const tail = cleanContent.slice(streamState.pushedLength);
                       if (!aborted && tail) writeChunk({ content: tail });
-                      if (!aborted) writeChunk({}, 'stop');
+                      if (!aborted) writeChunk({}, finishReason);
                       streamState.finished = true;
                       if (streamState.timer) clearTimeout(streamState.timer);
                       this.streamingOutputs.delete(handoffRequestId);
                       writeDone();
                     }, 10000);
                     return;
+                  } else {
+                    // 兼容路径：浏览器完全没推 /stream
+                    const tail = cleanContent.slice(streamState.pushedLength);
+                    if (!aborted && tail) {
+                      writeChunk({ content: tail });
+                    }
+                    if (!aborted) writeChunk({}, finishReason);
                   }
 
-                  const content = result.choices?.[0]?.message?.content || '';
-                  const tail = content.slice(streamState.pushedLength);
-                  if (!aborted && tail) {
-                    writeChunk({ content: tail });
-                  }
-                  if (!aborted) writeChunk({}, 'stop');
                   if (!aborted && data.stream_options?.include_usage) {
                     const usageChunk = {
                       id: requestId,
@@ -503,7 +512,10 @@ export class OpenAIApiServer {
             }
 
             const { request_id: requestId, text, done } = data;
-            const newText = String(text || '');
+            const rawText = String(text || '');
+            // 移除 <tool_call> 块：用户不应该在流式输出里看到工具调用指令。
+            // 最终工具调用信息由 .then() 分支单独发出。
+            const newText = this.cleanStreamText(rawText);
             const isDone = done === true;
 
             const state = this.streamingOutputs.get(requestId);
@@ -539,18 +551,13 @@ export class OpenAIApiServer {
             }
 
             if (isDone) {
-              if (!isAborted() && !state.finished) {
-                const tail = newText.slice(state.pushedLength);
-                if (tail) {
-                  state.writeChunk({ content: tail });
-                  state.pushedLength = newText.length;
-                }
-                state.writeChunk({}, 'stop');
-              }
-              state.finished = true;
-              if (state.timer) clearTimeout(state.timer);
-              this.streamingOutputs.delete(requestId);
-              if (!isAborted()) state.writeDone();
+              // 只标记浏览器已结束推送；最终输出由 handleChatCompletion 的
+              // .then() 分支决定（因为可能包含 tool_calls chunk）。
+              // 不做 writeDone()，也不 delete state —— 让 .then() 收尾。
+              state.browserDone = true;
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, accepted: accept, deferred: true }));
+              return;
             }
 
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -695,7 +702,10 @@ export class OpenAIApiServer {
 
   /**
    * Handle OpenAI Chat Completions API
-   * Converts OpenAI request format to bridge packet and routes to browser
+   * Converts OpenAI request format to bridge packet and routes to browser.
+   *
+   * 如果网页模型返回的内容中包含 <tool_call> 块，会解析成 OpenAI 的
+   * tool_calls 结构，并设置 finish_reason='tool_calls'。
    */
   async handleChatCompletion(openAiRequest, options = {}) {
     const {
@@ -727,9 +737,21 @@ export class OpenAIApiServer {
       requestId: options.requestId,
     });
 
+    const rawContent = result.content || '';
+    const { toolCalls, cleanContent } = this.parseToolCallsFromContent(rawContent);
+
     // Generate OpenAI-compatible response
     const requestId = `chatcmpl-${Date.now()}-${++this.requestIdCounter}`;
     const timestamp = Math.floor(Date.now() / 1000);
+
+    const message = {
+      role: 'assistant',
+      // OpenAI 规范：有 tool_calls 时 content 通常为 null
+      content: toolCalls.length > 0 ? (cleanContent || null) : (rawContent || ''),
+    };
+    if (toolCalls.length > 0) {
+      message.tool_calls = toolCalls;
+    }
 
     return {
       id: requestId,
@@ -739,17 +761,14 @@ export class OpenAIApiServer {
       choices: [
         {
           index: 0,
-          message: {
-            role: 'assistant',
-            content: result.content || '',
-          },
-          finish_reason: 'stop',
+          message,
+          finish_reason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
         },
       ],
       usage: {
         prompt_tokens: this.estimateTokens(prompt),
-        completion_tokens: this.estimateTokens(result.content || ''),
-        total_tokens: this.estimateTokens(prompt) + this.estimateTokens(result.content || ''),
+        completion_tokens: this.estimateTokens(rawContent),
+        total_tokens: this.estimateTokens(prompt) + this.estimateTokens(rawContent),
       },
       system_fingerprint: 'universal-agent-bridge',
     };
@@ -785,13 +804,31 @@ export class OpenAIApiServer {
   }
 
   /**
+   * 判断一条 user context 是否属于"每轮都必须重新投喂"的环境信息。
+   *
+   * Copilot 每轮都会把这些块原样带上（hash 相同），我们的 sentHashes
+   * 去重会命中并跳过 —— 但模型确实每轮都需要它们才能正常工作：
+   * 尤其是 <workspace_info> 里的工作区路径。跳过后模型会从 system
+   * prompt 里的零碎路径（如 VSCODE_TARGET_SESSION_LOG）瞎拼出
+   * /opt/.../workspaceStorage/<uuid> 这种假路径。
+   *
+   * 这类块体积小（几百 token），每轮重发的成本可控；相比丢失路径
+   * 导致的工具调用失败，代价可以忽略。
+   */
+  isPersistentContext(content) {
+    return /<environment_info>|<workspace_info>|<userMemory>|<sessionMemory>|<repoMemory>/.test(content);
+  }
+
+  /**
    * 把 messages 拆成带类型的 blocks，供浏览器端做增量去重。
    *
    * block kind 分类：
-   *   system  - role=system 的消息
-   *   tools   - 请求体顶层的 tools 数组（序列化后作为单个 block）
-   *   context - 非最后一条 role=user 的消息（历史 + 环境上下文等）
-   *   turn    - 最后一条 role=user 的消息（本次新问题，永不去重）
+   *   system        - role=system 的消息
+   *   tools         - 请求体顶层的 tools 数组（JSON 序列化后作为单个 block）
+   *   tool_protocol - 工具调用格式说明（仅当请求带 tools 时生成）
+   *   context       - 非最后一条 role=user 的消息（历史 + 环境上下文等）
+   *   tool_result   - role=tool 的消息（工具执行结果），按 call_id 关联工具名
+   *   turn          - 最后一条 role=user 的消息（本次新问题，永不去重）
    *
    * assistant 消息一律忽略：网页对话本身已有历史，不需要重复注入。
    *
@@ -818,30 +855,319 @@ export class OpenAIApiServer {
       if (content) blocks.push({ kind: 'system', content });
     }
 
-    // 2) tools（序列化后作为单个 block）
+    // 2) tools + tool_protocol
     if (Array.isArray(tools) && tools.length > 0) {
       blocks.push({ kind: 'tools', content: JSON.stringify(tools) });
+      blocks.push({
+        kind: 'tool_protocol',
+        content: this.buildToolProtocolPrompt(tools),
+      });
     }
 
-    // 3) 定位最后一条 user，用于区分 context / turn
+    // 3) 建立 tool_call_id -> tool_name 的映射
+    // Copilot 会把上一轮 bridge 返回的 tool_calls 原样带回来，
+    // 每个 id 对应一个工具名。tool 消息只带 id，需要靠这个映射恢复工具名。
+    const toolCallMap = new Map();
+    for (const m of messages) {
+      if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          if (tc?.id && tc?.function?.name) {
+            toolCallMap.set(tc.id, tc.function.name);
+          }
+        }
+      }
+    }
+
+    // 4) 定位最后一条 user，用于区分 context / turn
     let lastUserIdx = -1;
     for (let i = 0; i < messages.length; i += 1) {
       if (messages[i]?.role === 'user') lastUserIdx = i;
     }
 
-    // 4) user 消息
+    // 5) 按顺序生成 blocks
     for (let i = 0; i < messages.length; i += 1) {
       const m = messages[i];
-      if (m?.role !== 'user') continue;
-      const content = contentOf(m);
-      if (!content) continue;
-      blocks.push({
-        kind: i === lastUserIdx ? 'turn' : 'context',
-        content,
-      });
+      if (!m) continue;
+
+      if (m.role === 'system') continue;    // 已处理
+      if (m.role === 'assistant') continue; // 网页模型自己记得它的输出
+
+      if (m.role === 'user') {
+        const content = contentOf(m);
+        if (!content) continue;
+        const isTurn = i === lastUserIdx;
+        blocks.push({
+          kind: isTurn ? 'turn' : 'context',
+          content,
+          // 环境/工作区/记忆类上下文：每轮都发，不参与去重
+          alwaysSend: !isTurn && this.isPersistentContext(content),
+        });
+        continue;
+      }
+
+      if (m.role === 'tool') {
+        const callId = m.tool_call_id;
+        const toolName = (callId && toolCallMap.get(callId)) || 'unknown_tool';
+        const content = contentOf(m) || '(empty result)';
+        blocks.push({
+          kind: 'tool_result',
+          content: `TOOL_RESULT (tool=${toolName}):\n${content}`,
+        });
+        continue;
+      }
     }
 
     return blocks;
+  }
+
+  /**
+   * 生成工具调用协议说明。仅当请求带 tools 时生成，作为独立 block
+   * 发送给网页模型，明确要求它按 <tool_call> 格式输出。
+   *
+   * 不这样做的话，模型会按它自己训练过的格式输出（例如 DeepSeek 的
+   * <｜｜DSML｜｜ calls>、OpenAI 的 function_call XML、markdown json
+   * 代码块等），agent 客户端无法解析。
+   *
+   * 设计要点（来自实测踩过的坑）：
+   *   1) 模型倾向于在 tool_call 前后加"我先看看..."这类叙述 —— 必须禁止
+   *   2) 模型偶尔会多吐一个 </tool_call> —— 必须显式强调"唯一闭标签"
+   *   3) 模型不知道工作区路径时会从 system prompt 里抓零碎片段瞎拼
+   *      （如把 VSCODE_TARGET_SESSION_LOG 里的 UUID 当成 cwd）——
+   *      必须要求路径未知时先探测，绝不允许猜测
+   *   4) 模型偶尔会在 tool_call 后继续输出最终答案 —— 必须明确"emit 后
+   *      立即停止，等待 TOOL_RESULT"
+   */
+  buildToolProtocolPrompt(tools) {
+    const toolNames = tools
+      .map((t) => t?.function?.name)
+      .filter((n) => typeof n === 'string')
+      .join(', ');
+
+    return [
+      'TOOL CALLING PROTOCOL',
+      '',
+      'You are connected to an external tool runner. You may invoke tools to complete the user\'s request. Follow the rules below EXACTLY — the runner parses your output mechanically and cannot tolerate deviations.',
+      '',
+      '### Invocation format',
+      '',
+      'To invoke a tool, emit a block in EXACTLY this form:',
+      '',
+      '<tool_call>',
+      '```json',
+      '{"name": "<tool_name>", "arguments": {<json_arguments>}}',
+      '```',
+      '</tool_call>',
+      '',
+      '### Hard rules',
+      '',
+      '1. OUTPUT SHAPE. When you decide to call tools, your entire response MUST consist solely of one or more <tool_call> blocks. Do NOT output any prose, greeting, acknowledgement, plan, explanation, or trailing summary — not before, not between, not after the blocks.',
+      '2. JSON INSIDE CODE FENCE. The JSON object MUST be inside a fenced code block tagged exactly ```json, and that code block MUST be wrapped by <tool_call> ... </tool_call>. The fence is REQUIRED because the runner reads the JSON from the rendered code block; without it your arguments may be corrupted by the UI\'s markdown renderer.',
+      '3. ONE TAG PER BLOCK. Each <tool_call> block opens with exactly one <tool_call> tag and closes with exactly one </tool_call> tag. Never emit duplicate or stray closing tags.',
+      '4. NO NESTING. Never nest one <tool_call> block inside another. For multiple tools, emit each block sequentially: close the first </tool_call> BEFORE opening the next <tool_call>.',
+      '5. NO CONTROL TOKENS. Never emit model-specific control tokens such as <｜｜DSML｜｜ calls> or <|tool_calls|>. They will be rejected by the runner.',
+      '6. ARGUMENTS. "arguments" MUST be a JSON object (not a string) whose fields match the tool\'s parameter schema. Include every required field. Use correct JSON types (numbers as numbers, booleans as booleans).',
+      '7. STOP AFTER EMITTING. Immediately after the last </tool_call> tag, STOP. Do not continue with the final answer. The runner will execute the calls and reply with one TOOL_RESULT block per call.',
+      '8. PATHS. Whenever a parameter expects a file or directory path, provide an ABSOLUTE path. If you do not know the current working directory, do NOT guess or infer it from unrelated context — first call a tool that reveals it (for example, run `pwd` in the terminal) and wait for its result.',
+      '9. WHEN TO FINISH. When you no longer need any tool — i.e. you can answer the user directly — respond with the final answer as plain text, WITHOUT any <tool_call> block.',
+      '',
+      '### Positive example',
+      '',
+      'User asks to list the workspace. Correct response (entire response, nothing else):',
+      '',
+      '<tool_call>',
+      '```json',
+      '{"name": "list_dir", "arguments": {"path": "/home/user/project"}}',
+      '```',
+      '</tool_call>',
+      '',
+      '### Negative examples — never produce output like these',
+      '',
+      'WRONG (JSON not wrapped in a code fence):',
+      '  <tool_call>{"name": "list_dir", "arguments": {"path": "/"}}</tool_call>',
+      '',
+      'WRONG (extra prose around the block):',
+      '  Sure, I\'ll list the directory first.',
+      '  <tool_call>',
+      '  ```json',
+      '  {"name": "list_dir", "arguments": {"path": "/"}}',
+      '  ```',
+      '  </tool_call>',
+      '',
+      'WRONG (two tool_calls nested instead of sequential):',
+      '  <tool_call><tool_call>...</tool_call></tool_call>',
+      '',
+      '### Available tools',
+      '',
+      toolNames || '(none)',
+    ].join('\n');
+  }
+
+  /**
+   * 从网页模型的原始输出里提取工具调用，转换成 OpenAI 的
+   * tool_calls 结构；同时返回去掉这些调用后的纯文本内容。
+   *
+   * 解析策略：**不依赖 <tool_call> 标签**，而是扫描所有形如
+   *   {"name": "<tool>", "arguments": { ... }}
+   * 的 JSON 对象。原因是模型经常在标签层面出错：
+   *
+   *   - 忘记关闭 </tool_call>
+   *   - 把多个 tool_call 嵌套写
+   *     （<tool_call>A <tool_call>B</tool_call></tool_call>）
+   *   - 使用它训练时见过的其他标签
+   *     （DeepSeek 的 <｜｜DSML｜｜ calls>）
+   *   - 漏掉 <tool_call> 直接吐裸 JSON
+   *
+   * 只要 JSON 对象本身合法，就能提取出来。JSON 骨架用括号平衡匹配
+   * 找边界（正确处理字符串里的 { } 和转义），比正则可靠。
+   */
+  parseToolCallsFromContent(content) {
+    const toolCalls = [];
+    if (!content) return { toolCalls, cleanContent: '' };
+
+    const consumedRanges = [];
+    const jsonObjects = this.extractJsonObjects(content);
+
+    for (const { json, start, end } of jsonObjects) {
+      let obj;
+      try {
+        obj = JSON.parse(json);
+      } catch {
+        // 非法 JSON（例如残缺的 tool_call），跳过
+        continue;
+      }
+      if (!obj || typeof obj !== 'object') continue;
+      if (typeof obj.name !== 'string') continue;
+      // 必须同时有 name 和 arguments 才认为是一个 tool_call。
+      // 只有 name 没有 arguments 的对象很可能是在解释格式，不应当成调用。
+      if (!('arguments' in obj)) continue;
+
+      const args = obj.arguments;
+      toolCalls.push({
+        id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+        type: 'function',
+        function: {
+          name: obj.name,
+          // OpenAI 规范要求 arguments 是 JSON 字符串
+          arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
+        },
+      });
+      consumedRanges.push([start, end]);
+    }
+
+    // 从后往前删除已消费的 JSON 区间，保持前面索引有效
+    let cleanContent = content;
+    for (let i = consumedRanges.length - 1; i >= 0; i--) {
+      const [s, e] = consumedRanges[i];
+      cleanContent = cleanContent.slice(0, s) + cleanContent.slice(e);
+    }
+
+    // 清理各种残留标签和特殊 token
+    cleanContent = this.stripToolSyntax(cleanContent);
+
+    return { toolCalls, cleanContent };
+  }
+
+  /**
+   * 扫描文本中所有合法的 {...} JSON 对象。用括号平衡匹配：
+   *   - 正确处理嵌套对象/数组
+   *   - 正确处理字符串字面量里的 { } 和转义字符 \"
+   *
+   * 返回 [{ json, start, end }, ...]，按出现顺序排列。
+   * 快速预检：JSON 文本里必须出现 "name" 键，才纳入候选。
+   */
+  extractJsonObjects(text) {
+    const results = [];
+    if (!text) return results;
+    const n = text.length;
+
+    for (let i = 0; i < n; i++) {
+      if (text[i] !== '{') continue;
+
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      let end = -1;
+
+      for (let j = i; j < n; j++) {
+        const c = text[j];
+        if (escaped) { escaped = false; continue; }
+        if (c === '\\') { escaped = true; continue; }
+        if (c === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (c === '{') {
+          depth++;
+        } else if (c === '}') {
+          depth--;
+          if (depth === 0) { end = j; break; }
+        }
+      }
+
+      if (end === -1) continue;   // 这个 { 没配对，跳过它继续找下一个
+
+      const json = text.slice(i, end + 1);
+      if (!/"name"\s*:/.test(json)) continue;   // 不跳 i，允许扫到内层
+      results.push({ json, start: i, end: end + 1 });
+      i = end;   // 只有识别为 tool_call 才跳过
+    }
+
+    return results;
+  }
+
+  /**
+   * 清理模型输出里各种"工具调用语法残留"：
+   *   - <tool_call> / </tool_call> 成对或孤立标签
+   *   - DeepSeek 特有 token：<｜｜DSML｜｜ ...> 或 </｜｜...>
+   *   - 通用特殊 token：<|...|>
+   */
+  stripToolSyntax(text) {
+    if (!text) return '';
+    return text
+      .replace(/<\/?tool_call>/g, '')
+      // DeepSeek 特殊 token：<｜｜...> 或 </｜｜...>
+      .replace(/<\/?｜[^>]*>/g, '')
+      // 通用特殊 token：<|...|> / <|...>
+      .replace(/<\|[^>]*?\|>/g, '')
+      .replace(/<\|[^>]*>/g, '')
+      // 残留的空 code fence（JSON 已被 consume 掉后剩下的壳）
+      .replace(/```json\s*```/g, '')
+      .replace(/```\s*```/g, '')
+      .trim();
+  }
+
+  /**
+   * 流式推送时对累积文本做清理：
+   *   - 移除已闭合的 <tool_call>...</tool_call> 块
+   *   - 遇到未闭合的 <tool_call> 或 DeepSeek 特殊 token 起始（<｜），
+   *     截断到它之前，避免 tool_call 内容被流式推给用户
+   *
+   * 真正的工具调用信息会由最终帧的 tool_calls chunk 单独发出。
+   */
+  cleanStreamText(text) {
+    if (!text) return '';
+    let result = text.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '');
+
+    const markers = ['<tool_call>', '<｜'];
+    let cutAt = result.length;
+    for (const m of markers) {
+      const i = result.indexOf(m);
+      if (i !== -1 && i < cutAt) cutAt = i;
+    }
+    return result.slice(0, cutAt);
+  }
+
+  /**
+   * 把 tool_calls 数组转换成 OpenAI SSE 的 delta 结构。
+   */
+  buildToolCallsDelta(toolCalls) {
+    return toolCalls.map((tc, idx) => ({
+      index: idx,
+      id: tc.id,
+      type: tc.type,
+      function: {
+        name: tc.function.name,
+        arguments: tc.function.arguments,
+      },
+    }));
   }
 
   /**
