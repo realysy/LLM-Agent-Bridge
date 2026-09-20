@@ -36,7 +36,7 @@ The Universal Agent Bridge now provides an **OpenAI-compatible API endpoint** th
 3. **流式输出** — 网页 500ms 采样累积文本，SSE 端 delta 实时推给客户端
 4. **工具调用** — 通过 VSCode Copilot（`deepseek-web` / `qwen-web`）验证：
 
-  测试步骤: [./agent-test-procedure.md](./agent-test-procedure.md), 观察:
+   测试步骤：[./agent-test-procedure.md](./agent-test-procedure.md)，观察：
 
    - 单轮 tool_calls 解析与执行
    - 多轮工具循环（create_file → read_file → run_in_terminal → …）

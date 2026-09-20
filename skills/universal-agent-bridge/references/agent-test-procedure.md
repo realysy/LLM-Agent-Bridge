@@ -4,4 +4,4 @@
 4. IF agent not commit it autoly, say: commit it
 5. 改进这个工程，将库封装为独立的cmake package, 然后在main所在package中通过find\_package查找链接
 
-   IF agent not commit it autoly, say: if git管理，注意忽略不必要的文件
+   IF agent not commit it autoly, say: git管理，注意忽略不必要的文件
