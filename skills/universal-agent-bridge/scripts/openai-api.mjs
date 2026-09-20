@@ -19,6 +19,9 @@ import { createServer } from 'node:http';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { exec } from 'node:child_process';
+import { writeFileSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 const DEFAULT_PORT = 8765;
@@ -48,6 +51,40 @@ const PLATFORM_MODELS = {
   doubao: { id: 'doubao-web', name: 'Doubao Web' },
   glm: { id: 'glm-web', name: 'GLM Web' },
 };
+
+// 是否启用调试日志
+const DEBUG_LOG_ENABLED = /^(1|true|yes)$/i.test(process.env.BRIDGE_DEBUG_LOG || '');
+
+const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = dirname(dirname(dirname(SCRIPT_DIR)));
+const DEBUG_LOG_DIR = join(REPO_ROOT, 'logs');  // 日志文件路径: <repo_root>/logs/
+
+/**
+ * 本地时区 ISO-ish 时间戳，毫秒精度。
+ * 用 '-' 替换 ':' 和 '.'，兼容 Windows 文件名（不允许冒号）。
+ * 示例：2026-09-20T11-27-28-853
+ */
+function formatLocalTimestamp(date = new Date()) {
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    + `T${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
+    + `-${pad(date.getMilliseconds(), 3)}`;
+}
+
+/**
+ * 把原始请求体落盘。启用时才执行。
+ * 任何 IO 错误都只 warn，不影响主流程。
+ */
+function dumpDebugRequest(data) {
+  if (!DEBUG_LOG_ENABLED) return;
+  try {
+    mkdirSync(DEBUG_LOG_DIR, { recursive: true });
+    const file = join(DEBUG_LOG_DIR, `${formatLocalTimestamp()}.json`);
+    writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.warn('[DebugLog] failed to persist request:', e.message);
+  }
+}
 
 export function openBrowser(platform = 'chatgpt') {
   const url = PLATFORM_URLS[platform] || PLATFORM_URLS.chatgpt;
@@ -214,6 +251,9 @@ export class OpenAIApiServer {
               }));
               return;
             }
+
+            // 调试用：落盘原始请求（BRIDGE_DEBUG_LOG=1 时启用）
+            dumpDebugRequest(data);
 
             const wantsStream = data.stream === true;
 
@@ -1068,12 +1108,22 @@ export class OpenAIApiServer {
   }
 
   /**
-   * 扫描文本中所有合法的 {...} JSON 对象。用括号平衡匹配：
+   * 扫描文本中所有形如 {...} 的平衡 JSON 片段，返回其中**含 `"name":`
+   * 字段的候选对象**。
+   *
+   * 为什么要预检 `"name"`：
+   *   本函数的调用方只有 parseToolCallsFromContent，它只关心
+   *   tool_call 对象（必须有顶层 name）。其他 JSON（比如用户提供的
+   *   schema、嵌套的 arguments 内容）直接跳过，可以省下一次
+   *   JSON.parse，也不会污染候选集。
+   *
+   * 为什么用括号平衡而不是正则：
    *   - 正确处理嵌套对象/数组
    *   - 正确处理字符串字面量里的 { } 和转义字符 \"
+   *   - 遇到未闭合的 { 时只跳过它，不影响后续扫描
+   *     （历史 bug：曾经 break，导致前面任何一个孤立 { 就丢弃全部）
    *
    * 返回 [{ json, start, end }, ...]，按出现顺序排列。
-   * 快速预检：JSON 文本里必须出现 "name" 键，才纳入候选。
    */
   extractJsonObjects(text) {
     const results = [];
@@ -1417,7 +1467,10 @@ curl http://localhost:8765/v1/chat/completions \\
   if (command === 'serve') {
     const server = new OpenAIApiServer(port, apiKey, host);
     await server.start();
-    console.log(`[OpenAIApiServer] Listening on http://${host}:${port}`);
+    // --port 0 时 OS 会分配随机端口，日志必须打实际端口，
+    // 否则测试无法得知该连到哪。
+    const actualPort = server.server.address().port;
+    console.log(`[OpenAIApiServer] Listening on http://${host}:${actualPort}`);
     console.log(`[OpenAIApiServer] OpenAI-compatible API ready at /v1/chat/completions`);
     console.log(`[OpenAIApiServer] API Key: ${apiKey}`);
     console.log(`[OpenAIApiServer] Ready for ChatGPT / Claude / DeepSeek / Gemini / Kimi / Grok / Qwen / Doubao / GLM connections.`);

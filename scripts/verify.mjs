@@ -156,6 +156,14 @@ async function runAllChecks() {
       'POST `/stream`',
       'request_id',
       '累积文本',
+      // Tool Use 相关
+      '## Tool Use (Function Calling)',
+      'tool_calls',
+      '<tool_call>',
+      'alwaysSend',
+      // Debug Logging 相关
+      '## Debug Logging',
+      'BRIDGE_DEBUG_LOG',
     ]),
   ];
 

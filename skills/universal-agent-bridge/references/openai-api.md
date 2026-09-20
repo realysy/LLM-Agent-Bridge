@@ -230,6 +230,163 @@ curl http://localhost:8765/v1/chat/completions \
   ...
 ```
 
+## Tool Use (Function Calling)
+
+The server bridges OpenAI-style `tools` / `tool_calls` to web models via a
+plain-text protocol. Web models emit tool calls in a strict block format;
+the server parses them back into standard OpenAI `tool_calls`.
+
+### Request with tools
+
+```bash
+curl http://localhost:8765/v1/chat/completions \
+  -H "Authorization: Bearer sk-bridge-local-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-web",
+    "messages": [
+      {"role": "user", "content": "list files in current dir"}
+    ],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "bash",
+        "description": "Execute a bash command",
+        "parameters": {
+          "type": "object",
+          "properties": {"command": {"type": "string"}},
+          "required": ["command"]
+        }
+      }
+    }]
+  }'
+```
+
+### Response with tool_calls
+
+```json
+{
+  "id": "chatcmpl-...",
+  "object": "chat.completion",
+  "model": "deepseek-web",
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": "I'll list the files in the current directory.",
+      "tool_calls": [{
+        "id": "call_...",
+        "type": "function",
+        "function": {
+          "name": "bash",
+          "arguments": "{\"command\":\"ls -la\"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+OpenAI convention: `finish_reason` is `"tool_calls"` whenever at least one tool
+call is present; `content` is set to `null` if the model only emitted calls.
+
+### Model output protocol
+
+The server injects a `tool_protocol` block instructing the web model to emit
+each call in this exact form:
+
+```
+<tool_call>
+```json
+{"name": "<tool_name>", "arguments": {<json_arguments>}}
+```
+</tool_call>
+```
+
+The JSON is **inside a fenced code block** so the platform's markdown / KaTeX
+renderer doesn't corrupt `$…$`, `\"`, or `<…>` characters in arguments.
+
+### Multi-turn tool loop
+
+On each subsequent round, the agent client (Copilot, Claude Code, Cursor, etc.)
+sends back:
+
+- An `assistant` message carrying the previous `tool_calls` (ignored by the
+  bridge — the web conversation already holds the model's own output).
+- One or more `role: "tool"` messages with execution results. Each is mapped
+  by `tool_call_id` to the tool name via the assistant message's `tool_calls`
+  array and re-emitted as a `TOOL_RESULT (tool=<name>):` block.
+- The original `<workspace_info>` context block. This is marked `alwaysSend`
+  and re-injected every turn so the web model never loses the workspace path.
+
+### Deduplication
+
+The bridge dedupes unchanged blocks to save tokens:
+
+| Block kind | First turn | Subsequent turns |
+|------------|-----------|------------------|
+| `system` | sent | skipped |
+| `tools` (large JSON) | sent | skipped |
+| `tool_protocol` | sent | skipped |
+| `context` — historical user messages | sent | skipped |
+| `context` — `<workspace_info>` etc. | sent | **sent every turn** |
+| `tool_result` — historical | sent | skipped |
+| `turn` — current user message | sent | sent |
+
+When the user opens a new web chat (URL session token changes), the bridge
+clears the dedup set and drops historical context, simulating a fresh session.
+`alwaysSend` blocks (workspace info) are still re-injected — a fresh chat
+needs them most.
+
+### Parser tolerance
+
+`parseToolCallsFromContent` extracts tool calls by scanning for any valid
+`{"name": ..., "arguments": ...}` JSON object, **regardless of outer tag**.
+This tolerates models that:
+
+- Forget to close `</tool_call>`.
+- Nest `<tool_call>` blocks instead of writing them sequentially.
+- Emit `<｜｜DSML｜｜ calls>` or `<|tool_calls|>` control tokens.
+- Skip the wrapper tags entirely and emit bare JSON.
+
+`arguments` may be a JSON object or a JSON string; the server always returns
+it as a string per the OpenAI spec.
+
+### Streaming and tool calls
+
+When a request includes `tools`, the userscript **does not stream**. Web UIs
+frequently corrupt tool-call JSON mid-stream (KaTeX consuming `$`, markdown
+renderers eating `<`). The bridge waits for the final DOM, extracts the full
+markdown, and delivers the tool calls in one non-streamed round-trip.
+
+---
+
+## Debug Logging
+
+Set `BRIDGE_DEBUG_LOG=1` to persist every incoming `/v1/chat/completions`
+request body to `<repo-root>/logs/<timestamp>.json`. Off by default.
+
+```bash
+BRIDGE_DEBUG_LOG=1 npm run api
+```
+
+Filenames use the **local timezone** (millisecond precision), with `:`
+and `.` replaced by `-` for Windows compatibility:
+
+```
+logs/2026-09-20T11-27-28-853.json
+```
+
+Use cases:
+
+- Reproduce a client-side bug by replaying the exact request body.
+- Inspect the precise `messages` / `tools` payload an agent client sends.
+- Debug token blow-up from repeated context blocks.
+
+> A full multi-turn agent session can emit several MB of logs. Clean the
+> `logs/` directory periodically, and keep it in `.gitignore`.
+
 ## Using with OpenAI SDK
 
 ### Python SDK

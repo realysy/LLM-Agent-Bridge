@@ -10,3 +10,4 @@ import './skill-discovery.test.mjs';
 import './validate-handoff.test.mjs';
 import './ws-transport.test.mjs';
 import './openai-api.test.mjs';
+import './tool-calls.test.mjs';
