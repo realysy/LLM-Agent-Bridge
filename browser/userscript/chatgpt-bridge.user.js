@@ -289,6 +289,9 @@
       case 'tools':   return `TOOLS:\n\n\`\`\`json\n${content}\n\`\`\``;
       case 'tool_protocol': return content;
       case 'tool_result':   return content;
+      // 工具调用强化提示：content 已是完整文本，不需要额外包装。
+      // alwaysSend=true 保证每轮都注入。
+      case 'tool_reinforcement': return content;
       case 'context': return `CONTEXT: ${content}`;
       case 'turn':    return `USER: ${content}`;
       default:        return content;

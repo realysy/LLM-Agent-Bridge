@@ -58,6 +58,72 @@ test.describe('buildToolProtocolPrompt', () => {
 });
 
 // ---------------------------------------------------------------------------
+// buildToolReinforcement / 状态驱动的强化提示
+// ---------------------------------------------------------------------------
+
+test.describe('buildToolReinforcement', () => {
+  const tools = [
+    { type: 'function', function: { name: 'list_dir', description: 'List', parameters: {} } },
+  ];
+
+  test('success 状态返回正向强化文案', () => {
+    const text = srv.buildToolReinforcement('success');
+    assert.ok(text);
+    assert.match(text, /GREAT/i);
+    assert.match(text, /<tool_call>/);
+    assert.match(text, /```json/);
+  });
+
+  test('failure 状态返回纠正文案', () => {
+    const text = srv.buildToolReinforcement('failure');
+    assert.ok(text);
+    assert.match(text, /WRONG/i);
+    assert.match(text, /DSML/);
+    assert.match(text, /<tool_call>/);
+  });
+
+  test('null / 未知状态返回 null', () => {
+    assert.strictEqual(srv.buildToolReinforcement(null), null);
+    assert.strictEqual(srv.buildToolReinforcement(undefined), null);
+    assert.strictEqual(srv.buildToolReinforcement('unknown'), null);
+  });
+
+  test('success 后带 tools 的请求会带上 tool_reinforcement block', () => {
+    const s = new OpenAIApiServer();
+    s.lastToolUseOutcome = 'success';
+    const blocks = s.buildBlocks([{ role: 'user', content: 'hi' }], tools);
+    const r = blocks.find(b => b.kind === 'tool_reinforcement');
+    assert.ok(r, 'should inject tool_reinforcement');
+    assert.strictEqual(r.alwaysSend, true);
+    assert.match(r.content, /GREAT/i);
+  });
+
+  test('failure 后带 tools 的请求会带上纠正 block', () => {
+    const s = new OpenAIApiServer();
+    s.lastToolUseOutcome = 'failure';
+    const blocks = s.buildBlocks([{ role: 'user', content: 'hi' }], tools);
+    const r = blocks.find(b => b.kind === 'tool_reinforcement');
+    assert.ok(r);
+    assert.strictEqual(r.alwaysSend, true);
+    assert.match(r.content, /WRONG/i);
+  });
+
+  test('null 状态时不注入 tool_reinforcement', () => {
+    const s = new OpenAIApiServer();
+    // 保持默认 null
+    const blocks = s.buildBlocks([{ role: 'user', content: 'hi' }], tools);
+    assert.ok(!blocks.some(b => b.kind === 'tool_reinforcement'));
+  });
+
+  test('无 tools 时不注入 tool_reinforcement（即使有状态）', () => {
+    const s = new OpenAIApiServer();
+    s.lastToolUseOutcome = 'success';
+    const blocks = s.buildBlocks([{ role: 'user', content: 'hi' }], null);
+    assert.ok(!blocks.some(b => b.kind === 'tool_reinforcement'));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // buildBlocks
 // ---------------------------------------------------------------------------
 
@@ -272,6 +338,128 @@ test.describe('parseToolCallsFromContent', () => {
     const { toolCalls, cleanContent } = srv.parseToolCallsFromContent('Hello, world!');
     assert.deepStrictEqual(toolCalls, []);
     assert.strictEqual(cleanContent, 'Hello, world!');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DSML 兜底解析（模型走偏时接住）
+// ---------------------------------------------------------------------------
+
+test.describe('parseDsmlToolCalls', () => {
+  test('形态 A：逐参数 DSML', () => {
+    const content = [
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="read_file">',
+      '<｜｜DSML｜｜ parameter name="filePath" string="true">/a/b.txt</｜｜DSML｜｜ parameter>',
+      '<｜｜DSML｜｜ parameter name="startLine" string="false">1</｜｜DSML｜｜ parameter>',
+      '<｜｜DSML｜｜ parameter name="endLine" string="false">40</｜｜DSML｜｜ parameter>',
+      '</｜｜DSML｜｜ invoke>',
+      '</｜｜DSML｜｜ calls>',
+    ].join('\n');
+    const { toolCalls, cleanContent } = srv.parseToolCallsFromContent(content);
+    assert.strictEqual(toolCalls.length, 1);
+    assert.strictEqual(toolCalls[0].function.name, 'read_file');
+    const args = JSON.parse(toolCalls[0].function.arguments);
+    assert.strictEqual(args.filePath, '/a/b.txt');
+    assert.strictEqual(args.startLine, 1);
+    assert.strictEqual(typeof args.startLine, 'number');
+    assert.ok(!cleanContent.includes('｜'));
+  });
+
+  test('形态 B：单个 arguments 参数（实测遇到的变体）', () => {
+    const content = [
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="list_dir">',
+      '<｜｜DSML｜｜ parameter name="arguments" string="false">{"path": "/home/ysy/mycode/test_agent_copilot"}</｜｜DSML｜｜ parameter>',
+      '</｜｜DSML｜｜ invoke>',
+      '</｜｜DSML｜｜ calls>',
+    ].join('\n');
+    const { toolCalls, cleanContent } = srv.parseToolCallsFromContent(content);
+    assert.strictEqual(toolCalls.length, 1);
+    assert.strictEqual(toolCalls[0].function.name, 'list_dir');
+    // 应展开成 {path: "/..."}，而不是 {arguments: {path: "/..."}}
+    const args = JSON.parse(toolCalls[0].function.arguments);
+    assert.deepStrictEqual(args, { path: '/home/ysy/mycode/test_agent_copilot' });
+    assert.ok(!cleanContent.includes('｜'));
+  });
+
+  test('多个 invoke 块', () => {
+    const content = [
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="read_file">',
+      '<｜｜DSML｜｜ parameter name="arguments" string="false">{"filePath": "/a"}</｜｜DSML｜｜ parameter>',
+      '</｜｜DSML｜｜ invoke>',
+      '<｜｜DSML｜｜ invoke name="read_file">',
+      '<｜｜DSML｜｜ parameter name="arguments" string="false">{"filePath": "/b"}</｜｜DSML｜｜ parameter>',
+      '</｜｜DSML｜｜ invoke>',
+      '</｜｜DSML｜｜ calls>',
+    ].join('\n');
+    const { toolCalls } = srv.parseToolCallsFromContent(content);
+    assert.strictEqual(toolCalls.length, 2);
+    assert.strictEqual(JSON.parse(toolCalls[0].function.arguments).filePath, '/a');
+    assert.strictEqual(JSON.parse(toolCalls[1].function.arguments).filePath, '/b');
+  });
+
+  test('形态 B 中的多行字符串完整保留', () => {
+    const code = '#!/usr/bin/env bash\nset -e\necho "hi"';
+    const content = [
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="create_file">',
+      `<｜｜DSML｜｜ parameter name="arguments" string="false">${JSON.stringify({ filePath: '/tmp/x.sh', content: code })}</｜｜DSML｜｜ parameter>`,
+      '</｜｜DSML｜｜ invoke>',
+      '</｜｜DSML｜｜ calls>',
+    ].join('\n');
+    const { toolCalls } = srv.parseToolCallsFromContent(content);
+    assert.strictEqual(toolCalls.length, 1);
+    const args = JSON.parse(toolCalls[0].function.arguments);
+    assert.strictEqual(args.content, code);
+  });
+
+  test('DSML 前后的叙述文本保留在 content 中', () => {
+    const content = [
+      'Two issues: compile.sh was not updated.',
+      '',
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="list_dir">',
+      '<｜｜DSML｜｜ parameter name="arguments" string="false">{"path": "/tmp"}</｜｜DSML｜｜ parameter>',
+      '</｜｜DSML｜｜ invoke>',
+      '</｜｜DSML｜｜ calls>',
+    ].join('\n');
+    const { toolCalls, cleanContent } = srv.parseToolCallsFromContent(content);
+    assert.strictEqual(toolCalls.length, 1);
+    assert.ok(cleanContent.includes('Two issues'));
+    assert.ok(!cleanContent.includes('list_dir'));
+  });
+
+  test('DSML 与 JSON 混用：两个调用都提取', () => {
+    const content = [
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="list_dir">',
+      '<｜｜DSML｜｜ parameter name="arguments" string="false">{"path": "/tmp"}</｜｜DSML｜｜ parameter>',
+      '</｜｜DSML｜｜ invoke>',
+      '</｜｜DSML｜｜ calls>',
+      'Also:',
+      '<tool_call>',
+      '```json',
+      '{"name": "read_file", "arguments": {"filePath": "/a", "startLine": 1, "endLine": 10}}',
+      '```',
+      '</tool_call>',
+    ].join('\n');
+    const { toolCalls } = srv.parseToolCallsFromContent(content);
+    assert.strictEqual(toolCalls.length, 2);
+    const names = toolCalls.map(tc => tc.function.name).sort();
+    assert.deepStrictEqual(names, ['list_dir', 'read_file']);
+  });
+
+  test('畸形 DSML（缺闭标签）不崩溃', () => {
+    const content = [
+      '<｜｜DSML｜｜ calls>',
+      '<｜｜DSML｜｜ invoke name="list_dir">',
+      '<｜｜DSML｜｜ parameter name="arguments" string="false">{"path": "/tmp"',
+    ].join('\n');
+    const { toolCalls, cleanContent } = srv.parseToolCallsFromContent(content);
+    assert.ok(Array.isArray(toolCalls));
+    assert.ok(!cleanContent.includes('<｜｜DSML｜｜'));
   });
 });
 

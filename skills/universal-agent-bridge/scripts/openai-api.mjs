@@ -120,6 +120,12 @@ export class OpenAIApiServer {
 
     // Request ID counter for OpenAI compatibility
     this.requestIdCounter = 0;
+
+    // 上一次工具调用的结果，用于在下一轮 tool_protocol 后注入强化提示：
+    //   'success' — 上一轮解析出了 tool_calls（协议遵守）
+    //   'failure' — 上一轮原文里有工具调用标记，但解析出 0 个 tool_calls（协议没被遵守）
+    //   null      — 尚未观测到工具调用轮次，或上一轮根本不是工具轮次
+    this.lastToolUseOutcome = null;
   }
 
   setCorsHeaders(res) {
@@ -780,6 +786,29 @@ export class OpenAIApiServer {
     const rawContent = result.content || '';
     const { toolCalls, cleanContent } = this.parseToolCallsFromContent(rawContent);
 
+    // 更新"上次工具调用结果"，供下一轮 buildBlocks 生成强化提示时使用：
+    //   - 解析出 toolCalls → 'success'（协议被遵守）
+    //   - 没解析出但原文有工具调用标记 → 'failure'（模型走偏了）
+    //   - 都没出现 → 保持原状态（本轮不是工具调用轮次）
+    if (Array.isArray(tools) && tools.length > 0) {
+      const prev = this.lastToolUseOutcome;
+      if (toolCalls.length > 0) {
+        this.lastToolUseOutcome = 'success';
+      } else {
+        // 全角竖线 U+FF5C 组成的 DeepSeek DSML token，与半角 `|` 不通用
+        const hasMarkers =
+          rawContent.includes('<tool_call') ||
+          rawContent.includes('<｜｜DSML｜｜') ||
+          rawContent.includes('<|tool_calls');
+        if (hasMarkers) {
+          this.lastToolUseOutcome = 'failure';
+        }
+      }
+      if (this.lastToolUseOutcome !== prev) {
+        console.log(`[ToolUse] outcome: ${prev ?? '(none)'} -> ${this.lastToolUseOutcome}`);
+      }
+    }
+
     // Generate OpenAI-compatible response
     const requestId = `chatcmpl-${Date.now()}-${++this.requestIdCounter}`;
     const timestamp = Math.floor(Date.now() / 1000);
@@ -895,13 +924,24 @@ export class OpenAIApiServer {
       if (content) blocks.push({ kind: 'system', content });
     }
 
-    // 2) tools + tool_protocol
+    // 2) tools + tool_protocol + tool_reinforcement
     if (Array.isArray(tools) && tools.length > 0) {
       blocks.push({ kind: 'tools', content: JSON.stringify(tools) });
       blocks.push({
         kind: 'tool_protocol',
         content: this.buildToolProtocolPrompt(tools),
       });
+
+      // 根据上一轮的成功/失败，注入针对性强化提示。
+      // 独立 block + alwaysSend：每轮都发，不污染 tool_protocol 的 hash。
+      const reinforcement = this.buildToolReinforcement(this.lastToolUseOutcome);
+      if (reinforcement) {
+        blocks.push({
+          kind: 'tool_reinforcement',
+          content: reinforcement,
+          alwaysSend: true,
+        });
+      }
     }
 
     // 3) 建立 tool_call_id -> tool_name 的映射
@@ -1043,42 +1083,173 @@ export class OpenAIApiServer {
   }
 
   /**
-   * 从网页模型的原始输出里提取工具调用，转换成 OpenAI 的
-   * tool_calls 结构；同时返回去掉这些调用后的纯文本内容。
+   * 生成工具调用格式的强化提示。
    *
-   * 解析策略：**不依赖 <tool_call> 标签**，而是扫描所有形如
-   *   {"name": "<tool>", "arguments": { ... }}
-   * 的 JSON 对象。原因是模型经常在标签层面出错：
+   * 目的：通过正向/负向反馈提高模型遵守协议的概率。
+   *   - 上一轮解析成功 → 正向强化，鼓励保持格式
+   *   - 上一轮解析失败 → 纠正提示，明确要求重试正确格式
+   *   - 尚未观测到工具调用 → 返回 null，不注入
    *
-   *   - 忘记关闭 </tool_call>
-   *   - 把多个 tool_call 嵌套写
-   *     （<tool_call>A <tool_call>B</tool_call></tool_call>）
-   *   - 使用它训练时见过的其他标签
-   *     （DeepSeek 的 <｜｜DSML｜｜ calls>）
-   *   - 漏掉 <tool_call> 直接吐裸 JSON
+   * 作为**独立 block**（kind='tool_reinforcement'）发送，不污染
+   * tool_protocol 的 hash —— 后者是静态去重的，混入动态内容会让它
+   * 每轮都重发，失去去重意义。
    *
-   * 只要 JSON 对象本身合法，就能提取出来。JSON 骨架用括号平衡匹配
-   * 找边界（正确处理字符串里的 { } 和转义），比正则可靠。
+   * 该 block 带 alwaysSend=true，每轮都随请求注入。
+   */
+  buildToolReinforcement(status) {
+    if (status !== 'success' && status !== 'failure') return null;
+
+    const example = [
+      '<tool_call>',
+      '```json',
+      '{"name": "<tool_name>", "arguments": {<json_arguments>}}',
+      '```',
+      '</tool_call>',
+    ].join('\n');
+
+    if (status === 'success') {
+      return [
+        'TOOL CALL FORMAT — REINFORCEMENT',
+        '',
+        'GREAT — your previous tool call was parsed successfully. Keep emitting tool calls in EXACTLY the same format:',
+        '',
+        example,
+        '',
+        'Do not deviate. Continue using this exact format for every subsequent call.',
+      ].join('\n');
+    }
+
+    // status === 'failure'
+    return [
+      'TOOL CALL FORMAT — CORRECTION',
+      '',
+      'WRONG — your previous round failed because the tool call was NOT in the required format. You MUST use EXACTLY this format:',
+      '',
+      example,
+      '',
+      'Do NOT use DSML (e.g. <｜｜DSML｜｜ …), function_call XML, <|tool_calls|>, bare JSON, or any other syntax. The <tool_call> wrapper AND the ```json code fence are both REQUIRED. Retry the same tool call using the format above.',
+    ].join('\n');
+  }
+
+  /**
+   * DeepSeek DSML 工具调用解析器（兜底）。
+   *
+   * 协议（tool_protocol block）已明确要求 JSON 格式，模型在绝大多数
+   * 轮次会遵守。但当上下文变长或模型"走神"时，它会退化到训练语料里
+   * 见过的 DSML 格式。这个解析器负责接住这种情况。
+   *
+   * 实测遇到两种形态，都要兼容：
+   *
+   *   形态 A（逐参数）：
+   *     <｜｜DSML｜｜ parameter name="filePath" string="true">/a/b.txt</｜｜DSML｜｜ parameter>
+   *     <｜｜DSML｜｜ parameter name="startLine" string="false">1</｜｜DSML｜｜ parameter>
+   *     → arguments = { filePath: "/a/b.txt", startLine: 1 }
+   *
+   *   形态 B（打包 arguments）：
+   *     <｜｜DSML｜｜ parameter name="arguments" string="false">{"path": "/a"}</｜｜DSML｜｜ parameter>
+   *     → arguments = { path: "/a" }
+   *
+   * 判定规则：若参数里只有唯一的 `arguments` 键且值是对象，直接展开。
+   *
+   * 返回 { calls, stripped }：calls 是 OpenAI tool_calls，stripped 是
+   * 移除 DSML 块后的剩余文本（供后续 JSON 扫描使用）。
+   */
+  parseDsmlToolCalls(content) {
+    const calls = [];
+    if (!content) return { calls, stripped: '' };
+
+    const blocksToRemove = [];
+    let stripped = content;
+
+    const callsRegex = /<｜｜DSML｜｜\s*calls>([\s\S]*?)<\/｜｜DSML｜｜\s*calls>/g;
+    const invokeRegex = /<｜｜DSML｜｜\s*invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*invoke>/g;
+    const paramRegex = /<｜｜DSML｜｜\s*parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)<\/｜｜DSML｜｜\s*parameter>/g;
+
+    let callsMatch;
+    while ((callsMatch = callsRegex.exec(content)) !== null) {
+      const inner = callsMatch[1];
+      invokeRegex.lastIndex = 0;
+
+      let invokeMatch;
+      while ((invokeMatch = invokeRegex.exec(inner)) !== null) {
+        const toolName = invokeMatch[1];
+        const paramsBlock = invokeMatch[2];
+        const rawArgs = {};
+
+        paramRegex.lastIndex = 0;
+        let paramMatch;
+        while ((paramMatch = paramRegex.exec(paramsBlock)) !== null) {
+          const pName = paramMatch[1];
+          // string="true" 或缺省 => 值按字符串处理；string="false" => 尝试 JSON.parse
+          const pIsString = paramMatch[2] !== 'false';
+          const pValue = paramMatch[3];
+          if (pIsString) {
+            rawArgs[pName] = pValue;
+          } else {
+            try { rawArgs[pName] = JSON.parse(pValue); }
+            catch { rawArgs[pName] = pValue; }
+          }
+        }
+
+        // 形态 B 展开：只有唯一的 arguments 键，且值是对象
+        let finalArgs = rawArgs;
+        const keys = Object.keys(rawArgs);
+        if (keys.length === 1 && keys[0] === 'arguments'
+            && rawArgs.arguments && typeof rawArgs.arguments === 'object') {
+          finalArgs = rawArgs.arguments;
+        }
+
+        if (toolName) {
+          calls.push({
+            id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+            type: 'function',
+            function: {
+              name: toolName,
+              arguments: JSON.stringify(finalArgs),
+            },
+          });
+        }
+      }
+
+      blocksToRemove.push([callsMatch.index, callsMatch.index + callsMatch[0].length]);
+    }
+
+    for (let i = blocksToRemove.length - 1; i >= 0; i--) {
+      const [s, e] = blocksToRemove[i];
+      stripped = stripped.slice(0, s) + stripped.slice(e);
+    }
+
+    return { calls, stripped };
+  }
+
+  /**
+   * 从网页模型的原始输出里提取工具调用。
+   *
+   * 解析顺序（两条路径互补，不互斥）：
+   *   1) DSML 兜底 —— 模型走偏到自己的训练格式时接住
+   *   2) JSON 协议 —— 模型遵守 tool_protocol 时的正常路径
+   *
+   * 先跑 DSML 是因为它的块里没有 {…}，JSON 扫描抓不到，必须单独处理。
+   * DSML 块被剥离后，剩余文本再走 JSON 扫描，互不干扰。
    */
   parseToolCallsFromContent(content) {
     const toolCalls = [];
     if (!content) return { toolCalls, cleanContent: '' };
 
+    // ---- 1) DSML 兜底解析 ----
+    const { calls: dsmlCalls, stripped } = this.parseDsmlToolCalls(content);
+    toolCalls.push(...dsmlCalls);
+    let working = stripped;
+
+    // ---- 2) JSON 协议解析 ----
     const consumedRanges = [];
-    const jsonObjects = this.extractJsonObjects(content);
+    const jsonObjects = this.extractJsonObjects(working);
 
     for (const { json, start, end } of jsonObjects) {
       let obj;
-      try {
-        obj = JSON.parse(json);
-      } catch {
-        // 非法 JSON（例如残缺的 tool_call），跳过
-        continue;
-      }
+      try { obj = JSON.parse(json); } catch { continue; }
       if (!obj || typeof obj !== 'object') continue;
       if (typeof obj.name !== 'string') continue;
-      // 必须同时有 name 和 arguments 才认为是一个 tool_call。
-      // 只有 name 没有 arguments 的对象很可能是在解释格式，不应当成调用。
       if (!('arguments' in obj)) continue;
 
       const args = obj.arguments;
@@ -1087,23 +1258,19 @@ export class OpenAIApiServer {
         type: 'function',
         function: {
           name: obj.name,
-          // OpenAI 规范要求 arguments 是 JSON 字符串
           arguments: typeof args === 'string' ? args : JSON.stringify(args ?? {}),
         },
       });
       consumedRanges.push([start, end]);
     }
 
-    // 从后往前删除已消费的 JSON 区间，保持前面索引有效
-    let cleanContent = content;
+    let cleanContent = working;
     for (let i = consumedRanges.length - 1; i >= 0; i--) {
       const [s, e] = consumedRanges[i];
       cleanContent = cleanContent.slice(0, s) + cleanContent.slice(e);
     }
 
-    // 清理各种残留标签和特殊 token
     cleanContent = this.stripToolSyntax(cleanContent);
-
     return { toolCalls, cleanContent };
   }
 
@@ -1173,12 +1340,15 @@ export class OpenAIApiServer {
     if (!text) return '';
     return text
       .replace(/<\/?tool_call>/g, '')
-      // DeepSeek 特殊 token：<｜｜...> 或 </｜｜...>
+      // 兜底 1：成对的 DSML 块（invoke / parameter），连同内容一并删除。
+      // 主要防畸形输入（模型写了开头忘了结尾，导致 parseDsmlToolCalls
+      // 匹配不到完整块）。
+      .replace(/<｜｜DSML｜｜[^>]*>[\s\S]*?<\/｜｜DSML｜｜[^>]*>/g, '')
+      // 兜底 2：自闭合或单侧的 DSML 标签（如 <｜｜DSML｜｜ calls>）
       .replace(/<\/?｜[^>]*>/g, '')
       // 通用特殊 token：<|...|> / <|...>
       .replace(/<\|[^>]*?\|>/g, '')
       .replace(/<\|[^>]*>/g, '')
-      // 残留的空 code fence（JSON 已被 consume 掉后剩下的壳）
       .replace(/```json\s*```/g, '')
       .replace(/```\s*```/g, '')
       .trim();
